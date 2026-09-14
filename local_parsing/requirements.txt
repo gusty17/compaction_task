@@ -1,0 +1,2 @@
+pyspark==3.5.5          # matches the bank's spark-operator custom image (Spark 3.5.5 / Scala 2.12)
+python-dotenv>=1.0      # loads the repo-root .env (Oracle + MinIO secrets)

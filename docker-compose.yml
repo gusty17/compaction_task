@@ -26,6 +26,25 @@ services:
       timeout: 5s
       retries: 15
 
+  # Not used by local_parsing (which talks to Oracle and the Iceberg REST
+  # catalog directly). Present because table maintenance -- compact.sh --
+  # runs as Trino SQL. See compact.sh.
+  trino:
+    image: trinodb/trino:483
+    container_name: trino
+    depends_on:
+      - oracle-xe
+      - iceberg-rest
+    ports:
+      - "8080:8080"
+    environment:
+      ORACLE_APP_USER: ${ORACLE_APP_USER:?Set ORACLE_APP_USER in .env}
+      ORACLE_APP_PASSWORD: ${ORACLE_APP_PASSWORD:?Set ORACLE_APP_PASSWORD in .env}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      - ./trino-catalog:/etc/trino/catalog
+
   minio:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     container_name: minio

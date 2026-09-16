@@ -1,50 +1,21 @@
 #!/usr/bin/env bash
 #
-# Iceberg table maintenance, run as Trino SQL.
+# Runner for compact.sql -- the maintenance logic lives there, this only
+# feeds it to Trino per table and checks the result.
 #
 #   bash compact.sh                          # maintain every table in bronze + staging
 #   bash compact.sh bronze.account_wide      # just one table
-#   bash compact.sh --check                  # report only, change nothing
-#   RETENTION=0s bash compact.sh             # local testing (see RETENTION below)
-#   ORPHANS=0 bash compact.sh                # skip step 3
+#   bash compact.sh --check                  # report fragmentation, change nothing
+#   RETENTION=0s bash compact.sh             # local testing (see compact.sql)
+#   ORPHANS=0 bash compact.sh                # skip step 3 of compact.sql
 #
-# WHY THIS EXISTS
-# ---------------
-# Every run of run_parsing.py leaves the table more fragmented. The Spark
-# write produces one small Parquet file per task, and because the tables are
-# merge-on-read, each daily MERGE also writes a delete file marking the old
-# version of every updated row. Nothing cleans either up. Queries then have to
-# open every data file AND every delete file and subtract deleted rows on the
-# fly, so read cost grows with the number of runs rather than the amount of
-# data. Measured here: 2 daily runs on a 10k-row table produced 3 data files +
-# 2 delete files holding 10,097 stored records for 10,001 live rows.
-#
-# THE THREE STEPS
-# ---------------
-#   1. optimize            Merges small files into large ones and applies the
-#                          merge-on-read deletes, so the delete files go away.
-#   2. expire_snapshots    Drops old table versions. Step 1 does NOT delete the
-#                          files it replaced -- Iceberg keeps them so you can
-#                          still time-travel -- so after step 1 alone storage
-#                          GOES UP. This is the step that reclaims it.
-#   3. remove_orphan_files Deletes files no snapshot references at all. Step 2
-#                          only reaches files it can still trace through
-#                          metadata; measured here, 5 files / 888 KB survived
-#                          step 2 and needed this to be freed.
-#
-# RETENTION (default 7d)
-# ----------------------
-# How much table history to keep. This is also your time-travel window --
-# anything older is permanently gone. Trino refuses a value below the
-# catalog's min-retention (trino-catalog/iceberg.properties, set to 0s on this
-# local stack only).
-#
-# SAFETY: step 3 deletes any unreferenced file older than RETENTION, and a file
-# a concurrently running write job has staged but not yet committed looks
-# exactly like an unreferenced file. Run maintenance when writers are idle, and
-# do not shorten RETENTION in production to reclaim space faster.
+# Trino has no procedural SQL -- no loops, and ALTER TABLE ... EXECUTE needs a
+# literal table name -- so table discovery, the before/after measurement and
+# the row-count guard have to live out here rather than in the .sql.
 set -euo pipefail
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SQL_FILE="$HERE/compact.sql"
 RETENTION="${RETENTION:-7d}"
 SCHEMAS="${SCHEMAS:-bronze staging}"
 ORPHANS="${ORPHANS:-1}"
@@ -59,20 +30,33 @@ for arg in "$@"; do
   esac
 done
 
+[ -f "$SQL_FILE" ] || { echo "missing $SQL_FILE" >&2; exit 1; }
+
 trino_q() { docker compose exec -T trino trino --catalog iceberg --execute "$1" 2>/dev/null; }
 
 # "<data files> <delete files> <bytes> <stored records> <live rows>"
 stats() {
   local counts rows
+  # record_count must be summed over data files only -- a delete file's
+  # record_count is its number of delete pointers, not stored rows.
   counts=$(trino_q "SELECT count_if(content = 0), count_if(content > 0),
-                           coalesce(sum(file_size_in_bytes), 0), coalesce(sum(record_count), 0)
+                           coalesce(sum(file_size_in_bytes), 0),
+                           coalesce(sum(record_count) FILTER (WHERE content = 0), 0)
                     FROM iceberg.$1.\"$2\$files\"" | tr -d '"' | tr ',' ' ')
   rows=$(trino_q "SELECT count(*) FROM iceberg.$1.$2" | tr -d '"')
   echo "$counts $rows"
 }
 
-fmt() {  # data delete bytes -> "3 data + 2 delete, 867 KB"
-  printf '%s data + %s delete, %s KB' "$1" "$2" "$(( $3 / 1024 ))"
+fmt() { printf '%s data + %s delete, %s KB' "$1" "$2" "$(( $3 / 1024 ))"; }
+
+# compact.sql with the placeholders filled in; step 3 dropped when ORPHANS=0.
+render_sql() {
+  local sql
+  sql=$(sed -e "s|__TABLE__|$1|g" -e "s|__RETENTION__|$RETENTION|g" "$SQL_FILE")
+  if [ "$ORPHANS" != "1" ]; then
+    sql=$(echo "$sql" | grep -v 'EXECUTE remove_orphan_files')
+  fi
+  echo "$sql"
 }
 
 maintain() {
@@ -89,11 +73,7 @@ maintain() {
     return 0
   fi
 
-  trino_q "ALTER TABLE $fq EXECUTE optimize" >/dev/null
-  trino_q "ALTER TABLE $fq EXECUTE expire_snapshots(retention_threshold => '$RETENTION')" >/dev/null
-  if [ "$ORPHANS" = "1" ]; then
-    trino_q "ALTER TABLE $fq EXECUTE remove_orphan_files(retention_threshold => '$RETENTION')" >/dev/null
-  fi
+  trino_q "$(render_sql "$fq")" >/dev/null
 
   read -r d1 x1 b1 r1 n1 <<<"$(stats "$schema" "$table")"
   printf '%-30s %-28s -> %s\n' "$schema.$table" "$(fmt "$d0" "$x0" "$b0")" "$(fmt "$d1" "$x1" "$b1")"
@@ -112,5 +92,7 @@ if [ "${#TABLES[@]}" -eq 0 ]; then
   done
 fi
 
-[ "$CHECK_ONLY" = "1" ] || echo "retention: $RETENTION   orphan sweep: $([ "$ORPHANS" = 1 ] && echo on || echo off)"
+if [ "$CHECK_ONLY" != "1" ]; then
+  echo "retention: $RETENTION   orphan sweep: $([ "$ORPHANS" = 1 ] && echo on || echo off)"
+fi
 for t in "${TABLES[@]}"; do maintain "${t%%.*}" "${t#*.}"; done

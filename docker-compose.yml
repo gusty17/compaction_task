@@ -4,15 +4,6 @@ services:
     container_name: oracle-xe
     environment:
       ORACLE_PASSWORD: ${ORACLE_PASSWORD:?Set ORACLE_PASSWORD in .env}
-      # Consumed by init-scripts/00_setup.sh (auto-run once on a fresh DB). It
-      # creates ORACLE_SCHEMA as the owning user, creates each table under
-      # init-scripts/<table>/create_*.sql (schema only, no data), optionally
-      # creates ORACLE_APP_USER, and GRANTs SELECT to PUBLIC. Data is seeded
-      # separately, per table, from the host -- see init-scripts/requirements.txt
-      # and e.g. init-scripts/account/seed_account.py.
-      # gvenzl's own APP_USER/APP_USER_PASSWORD are intentionally NOT set --
-      # 00_setup.sh does all user creation so ORACLE_APP_USER=system can't
-      # trigger a "CREATE USER system" failure.
       ORACLE_SCHEMA: ${ORACLE_SCHEMA:-source_table}
       ORACLE_SCHEMA_PASSWORD: ${ORACLE_SCHEMA_PASSWORD:-source_table}
       ORACLE_APP_USER: ${ORACLE_APP_USER:-system}
@@ -113,15 +104,6 @@ services:
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
       CATALOG_S3_ENDPOINT: http://minio:9000
       CATALOG_S3_PATH-STYLE-ACCESS: "true"
-      # Catalog registry (table name -> current metadata.json pointer) lives in
-      # the Postgres service above so it can be queried directly:
-      #   psql "postgresql://iceberg:iceberg@localhost:5433/iceberg_catalog"
-      #   SELECT table_namespace, table_name, metadata_location FROM iceberg_tables;
-      # The JDBC catalog auto-creates iceberg_tables / iceberg_namespace_properties
-      # on first use. Data + Iceberg metadata files still live in MinIO.
-      # NOTE: switching backends does not migrate the old SQLite registry -- the
-      # new Postgres catalog starts empty; re-create tables or CALL system.register_table.
-      # CATALOG_* -> Iceberg property: lowercase, '_'->'.', '__'->'-'.
       CATALOG_URI: jdbc:postgresql://iceberg-catalog-db:5432/${ICEBERG_CATALOG_DB_NAME:-iceberg_catalog}
       CATALOG_JDBC_USER: ${ICEBERG_CATALOG_DB_USER:-iceberg}
       CATALOG_JDBC_PASSWORD: ${ICEBERG_CATALOG_DB_PASSWORD:-iceberg}

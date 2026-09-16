@@ -1,6 +1,15 @@
 
 # This script sets up the Oracle database for the Trino XML project.
-# It creates the necessary users and tables, and seeds the data.
+# It creates the necessary users and tables -- schema only, no data.
+# Runs once, automatically, on a fresh DB volume (gvenzl's init mechanism).
+#
+# Data is seeded separately, per table, from the host -- e.g.:
+#   pip install -r init-scripts/requirements.txt
+#   python init-scripts/account/seed_account.py
+#
+# Adding a table: drop init-scripts/<table>/create_<table>.sql (schema-
+# qualified via __SCHEMA__, same pattern as init-scripts/account/) -- this
+# script picks it up automatically, no edits needed here.
 
 set -euo pipefail
 
@@ -45,20 +54,22 @@ END;
 /
 SQL
 
-# ── 3: fixture, schema-qualified via __SCHEMA__ substitution ──────────────────
-echo "[00_setup] loading fixture into schema ${SCHEMA}"
+# ── 3: create tables, schema-qualified via __SCHEMA__ substitution ────────────
 RENDERED="$(mktemp -d)"
 trap 'rm -rf "${RENDERED}"' EXIT
-sed "s/__SCHEMA__/${SCHEMA}/g" "${FIXTURES}/create_account_table.sql" > "${RENDERED}/create_account_table.sql"
-sed "s/__SCHEMA__/${SCHEMA}/g" "${FIXTURES}/seed_account_xml_bulk.sql" > "${RENDERED}/seed_account_xml_bulk.sql"
 
-sqlplus -s -L "${SCHEMA}/${SCHEMA_PWD}@localhost:1521/${PDB}" <<SQL
+for TABLE_SQL in "${FIXTURES}"/*/create_*.sql; do
+  [ -e "${TABLE_SQL}" ] || continue
+  NAME="$(basename "${TABLE_SQL}")"
+  echo "[00_setup] creating table from ${NAME}"
+  sed "s/__SCHEMA__/${SCHEMA}/g" "${TABLE_SQL}" > "${RENDERED}/${NAME}"
+  sqlplus -s -L "${SCHEMA}/${SCHEMA_PWD}@localhost:1521/${PDB}" <<SQL
 WHENEVER SQLERROR EXIT SQL.SQLCODE
 SET DEFINE OFF
 SET SQLBLANKLINES ON
-@${RENDERED}/create_account_table.sql
-@${RENDERED}/seed_account_xml_bulk.sql
+@${RENDERED}/${NAME}
 SQL
+done
 
 # ── 4: let everyone read the source tables ───────────────────────────────────
 echo "[00_setup] GRANT SELECT ON ${SCHEMA}.* TO PUBLIC"

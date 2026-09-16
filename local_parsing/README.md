@@ -130,8 +130,13 @@ inside it. If a venv genuinely isn't an option, `pip install --user
 --break-system-packages -r local_parsing/requirements.txt` is a user-scoped
 fallback that doesn't touch system-managed packages.
 
-The Docker stack must be up (`docker compose up -d`); Oracle seeds itself on a
-fresh DB via `init-scripts/00_setup.sh` (see repo-root README).
+The Docker stack must be up (`docker compose up -d`); on a fresh DB,
+`init-scripts/00_setup.sh` creates the users and tables (schema only). Data
+still needs seeding once, per table, from the host:
+```bash
+pip install -r init-scripts/requirements.txt
+python init-scripts/account/seed_account.py
+```
 
 ## What to edit in `config.py`
 

@@ -5,8 +5,11 @@ services:
     environment:
       ORACLE_PASSWORD: ${ORACLE_PASSWORD:?Set ORACLE_PASSWORD in .env}
       # Consumed by init-scripts/00_setup.sh (auto-run once on a fresh DB). It
-      # creates ORACLE_SCHEMA as the owning user, loads the fixture into it,
-      # optionally creates ORACLE_APP_USER, and GRANTs SELECT to PUBLIC.
+      # creates ORACLE_SCHEMA as the owning user, creates each table under
+      # init-scripts/<table>/create_*.sql (schema only, no data), optionally
+      # creates ORACLE_APP_USER, and GRANTs SELECT to PUBLIC. Data is seeded
+      # separately, per table, from the host -- see init-scripts/requirements.txt
+      # and e.g. init-scripts/account/seed_account.py.
       # gvenzl's own APP_USER/APP_USER_PASSWORD are intentionally NOT set --
       # 00_setup.sh does all user creation so ORACLE_APP_USER=system can't
       # trigger a "CREATE USER system" failure.

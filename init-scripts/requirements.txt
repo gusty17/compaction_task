@@ -1,0 +1,5 @@
+# Dependencies for init-scripts/**/seed_*.py (data seeding, run from the
+# host against the Oracle container's exposed port -- not used by 00_setup.sh
+# itself, which only creates schema/tables via sqlplus).
+oracledb>=2.0
+python-dotenv>=1.0

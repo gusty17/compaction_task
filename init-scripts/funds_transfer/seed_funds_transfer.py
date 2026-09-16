@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Seed source_table.account with test data (run after 00_setup.sh creates
+"""Seed source_table.funds_transfer with test data (run after 00_setup.sh creates
 the empty table).
 
 Usage:
     pip install -r init-scripts/requirements.txt
-    python init-scripts/account/seed_account.py [--count N] [--reset]
+    python init-scripts/funds_transfer/seed_funds_transfer.py [--count N] [--reset]
 
-Inserts the fixture row (reference/account_xml_data_sample.xml), then
-generates --count more by varying only `recid` (PK / MERGE key) and `c167`
-(config.py's date_field, spread across the trailing 365 days so both
-`daily` and `history` runs have data). Everything else is left as-is - this
-is for exercising the parsing pipeline and its timings, not field realism.
+Inserts the fixture row (reference/funds_transfer_xml_data_sample.xml), then
+generates --count more by varying only `recid` (PK / MERGE key) and `c121`
+(transaction_date -- its own tag number, unrelated to account's c167),
+spread across the trailing 365 days so both `daily` and `history` runs
+have data. Everything else is left as-is - this is for exercising the
+parsing pipeline and its timings, not field realism.
 
 Reruns are additive, continuing from the highest existing recid; --reset
 wipes the table first.
@@ -22,10 +23,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import _seed_lib as lib  # noqa: E402
 
-TABLE = "account"
-FIXTURE_XML = lib.REPO_ROOT / "reference" / "account_xml_data_sample.xml"
-DATE_TAG = "c167"
-DEFAULT_FIRST_RECID = 9000000120000001
+TABLE = "funds_transfer"
+FIXTURE_XML = lib.REPO_ROOT / "reference" / "funds_transfer_xml_data_sample.xml"
+DATE_TAG = "c121"
+DEFAULT_FIRST_RECID = 9000000160000001
 DEFAULT_ROW_COUNT = 10000
 
 

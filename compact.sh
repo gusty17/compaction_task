@@ -12,14 +12,22 @@
 # Trino has no procedural SQL -- no loops, and ALTER TABLE ... EXECUTE needs a
 # literal table name -- so table discovery, the before/after measurement and
 # the row-count guard have to live out here rather than in the .sql.
+#
+# Every run's output (per-table + TOTAL compaction time) is appended to
+# compact.log alongside the terminal, mirroring run_parsing.py's log file.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SQL_FILE="$HERE/compact.sql"
+LOG_FILE="$HERE/compact.log"
 RETENTION="${RETENTION:-7d}"
 SCHEMAS="${SCHEMAS:-bronze staging}"
 ORPHANS="${ORPHANS:-1}"
 CHECK_ONLY=0
+
+# terminal + log file, like run_parsing.py's dual logging
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "---- $(date -Iseconds) ----"
 
 TABLES=()
 for arg in "$@"; do
@@ -49,6 +57,11 @@ stats() {
 
 fmt() { printf '%s data + %s delete, %s KB' "$1" "$2" "$(( $3 / 1024 ))"; }
 
+now() { date +%s.%N; }
+elapsed() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%.2f", b-a}'; }
+
+TOTAL_COMPACT_SECONDS=0
+
 # compact.sql with the placeholders filled in; step 3 dropped when ORPHANS=0.
 render_sql() {
   local sql
@@ -73,10 +86,15 @@ maintain() {
     return 0
   fi
 
+  local t0 t1 dt
+  t0=$(now)
   trino_q "$(render_sql "$fq")" >/dev/null
+  t1=$(now)
+  dt=$(elapsed "$t0" "$t1")
+  TOTAL_COMPACT_SECONDS=$(awk -v a="$TOTAL_COMPACT_SECONDS" -v b="$dt" 'BEGIN{printf "%.2f", a+b}')
 
   read -r d1 x1 b1 r1 n1 <<<"$(stats "$schema" "$table")"
-  printf '%-30s %-28s -> %s\n' "$schema.$table" "$(fmt "$d0" "$x0" "$b0")" "$(fmt "$d1" "$x1" "$b1")"
+  printf '%-30s %-28s -> %-28s %6ss\n' "$schema.$table" "$(fmt "$d0" "$x0" "$b0")" "$(fmt "$d1" "$x1" "$b1")" "$dt"
 
   if [ "$n0" != "$n1" ]; then
     echo "  ERROR: row count changed $n0 -> $n1 for $fq" >&2
@@ -95,4 +113,11 @@ fi
 if [ "$CHECK_ONLY" != "1" ]; then
   echo "retention: $RETENTION   orphan sweep: $([ "$ORPHANS" = 1 ] && echo on || echo off)"
 fi
+
+COMPACT_START=$(now)
 for t in "${TABLES[@]}"; do maintain "${t%%.*}" "${t#*.}"; done
+
+if [ "$CHECK_ONLY" != "1" ]; then
+  echo "TOTAL compact step: $(elapsed "$COMPACT_START" "$(now)")s wall-clock" \
+       "(sum per-table ${TOTAL_COMPACT_SECONDS}s) across ${#TABLES[@]} table(s)"
+fi

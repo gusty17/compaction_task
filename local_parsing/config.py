@@ -91,13 +91,39 @@ DATASETS: dict[str, "Dataset"] = {
         target_table="bronze.account_wide",
         date_field="c167",
     ),
-    # ---- add more tables here, e.g.: --------------------------------------
-    # "customer": Dataset(
-    #     name="customer",
-    #     source_table="customer",
-    #     target_table="bronze.customer_wide",
-    #     date_field="c167",          # <- the customer table's own date tag
-    # ),
+    "customer": Dataset(
+        name="customer",
+        source_table="customer",
+        target_table="bronze.customer_wide",
+        date_field="c167",          # last_review_date -- same tag number as account's date_field
+    ),
+    "stmt_entry": Dataset(
+        name="stmt_entry",
+        source_table="stmt_entry",
+        target_table="bronze.stmt_entry_wide",
+        date_field="c78",           # trans_date -- its own tag number, unrelated to account's c167
+    ),
+    "loan": Dataset(
+        name="loan",
+        source_table="loan",
+        target_table="bronze.loan_wide",
+        date_field="c167",          # disbursement_date -- same tag number as account's date_field
+    ),
+    "funds_transfer": Dataset(
+        name="funds_transfer",
+        source_table="funds_transfer",
+        target_table="bronze.funds_transfer_wide",
+        date_field="c121",          # transaction_date -- its own tag number, unrelated to account's c167
+    ),
+    "collateral": Dataset(
+        name="collateral",
+        source_table="collateral",
+        target_table="bronze.collateral_wide",
+        date_field="c50",           # valuation_date -- its own tag number, unrelated to account's c167
+    ),
+    # ---- add more tables here: a new DATASETS entry + a matching
+    # init-scripts/<table>/ (create_<table>_table.sql, seed_<table>.py) +
+    # lookup_metadata.csv rows for table_name=<table>. ------------------------
 }
 
 

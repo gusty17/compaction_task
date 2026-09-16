@@ -220,12 +220,16 @@ def write_result(spark, df, target: str, write_mode: str, merge_key: str) -> Non
         )
 
 
-def run_one(spark, dataset, job, window_override=None) -> None:
+def run_one(spark, dataset, job, window_override=None, table_seconds: dict | None = None) -> None:
     """Parse + write a single dataset under a single job.  Raises on failure.
 
     ``window_override`` (start, end) comes from --start-date/--end-date on
     the CLI and takes precedence over the job's own default window - used to
     reprocess a missed/old day (daily) or a bounded slice of history.
+
+    ``table_seconds``, if given, gets ``dataset.name`` -> this call's total
+    parse+store time (sum of every phase below) - how main() builds the
+    per-table/run-total summary printed (and logged) at the end of a run.
     """
     from pyspark.sql import functions as F
 
@@ -259,6 +263,8 @@ def run_one(spark, dataset, job, window_override=None) -> None:
     if n == 0:
         logger.warning("nothing to write for %s in this window", dataset.name)
         raw_df.unpersist()
+        if table_seconds is not None:
+            table_seconds[dataset.name] = sum(timings.values())
         return
 
     phase("write_raw", lambda: write_raw(spark, raw_df, raw_target, dataset.merge_key))
@@ -277,6 +283,8 @@ def run_one(spark, dataset, job, window_override=None) -> None:
         logger.info("  %-16s %8.2f", name, secs)
     logger.info("  %-16s %8.2f", "TOTAL", sum(timings.values()))
     logger.info("source rows=%d  target(%s) rows=%d", n, target, final_n)
+    if table_seconds is not None:
+        table_seconds[dataset.name] = sum(timings.values())
 
 
 def _date_arg(s: str) -> str:
@@ -313,20 +321,32 @@ def main(argv=None) -> int:
         parser.error(f"unknown dataset {args.dataset!r}; known: {', '.join(config.DATASETS)} (or 'all')")
     job = config.JOBS[args.mode]
 
+    run_start = time.perf_counter()
     t = time.perf_counter()
     spark = build_spark_session(job)
-    logger.info("session_build     %8.2f", time.perf_counter() - t)
+    session_build_secs = time.perf_counter() - t
+    logger.info("session_build     %8.2f", session_build_secs)
 
     failed: list[str] = []
+    table_seconds: dict[str, float] = {}
     try:
         for ds in datasets:
             try:
-                run_one(spark, ds, job, window_override=window_override)
+                run_one(spark, ds, job, window_override=window_override, table_seconds=table_seconds)
             except Exception:  # noqa: BLE001
                 logger.exception("dataset %s FAILED - continuing with the rest", ds.name)
                 failed.append(ds.name)
     finally:
         spark.stop()
+
+    run_wall_secs = time.perf_counter() - run_start
+    logger.info("==== run summary  dataset=%s  mode=%s ====", args.dataset, job.name)
+    for name, secs in table_seconds.items():
+        logger.info("  %-16s %8.2fs", name, secs)
+    logger.info("  %-16s %8.2fs  (sum of per-table parse+store time)",
+                "SUM", sum(table_seconds.values()))
+    logger.info("TOTAL %s step: %.2fs wall-clock (session_build %.2fs + per-table %.2fs)",
+                job.name, run_wall_secs, session_build_secs, sum(table_seconds.values()))
 
     if failed:
         logger.error("FAILED datasets: %s", ", ".join(failed))

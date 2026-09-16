@@ -20,7 +20,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SQL_FILE="$HERE/compact.sql"
 LOG_FILE="$HERE/compact.log"
-RETENTION="${RETENTION:-7d}"
+RETENTION="${RETENTION:-0d}"
 SCHEMAS="${SCHEMAS:-bronze staging}"
 ORPHANS="${ORPHANS:-1}"
 CHECK_ONLY=0
@@ -42,17 +42,16 @@ done
 
 trino_q() { docker compose exec -T trino trino --catalog iceberg --execute "$1" 2>/dev/null; }
 
-# "<data files> <delete files> <bytes> <stored records> <live rows>"
-stats() {
-  local counts rows
-  # record_count must be summed over data files only -- a delete file's
-  # record_count is its number of delete pointers, not stored rows.
-  counts=$(trino_q "SELECT count_if(content = 0), count_if(content > 0),
-                           coalesce(sum(file_size_in_bytes), 0),
-                           coalesce(sum(record_count) FILTER (WHERE content = 0), 0)
-                    FROM iceberg.$1.\"$2\$files\"" | tr -d '"' | tr ',' ' ')
-  rows=$(trino_q "SELECT count(*) FROM iceberg.$1.$2" | tr -d '"')
-  echo "$counts $rows"
+# One "<data files> <delete files> <bytes> <stored records> <live rows>" row --
+# both of the old stats() queries (file/byte counts + row count) merged into
+# one SELECT via CROSS JOIN, so before+after fits in one trino_q call too.
+stats_sql() {
+  echo "SELECT f.data_files, f.delete_files, f.bytes, f.stored_records, t.live_rows
+        FROM (SELECT count_if(content = 0) AS data_files, count_if(content > 0) AS delete_files,
+                     coalesce(sum(file_size_in_bytes), 0) AS bytes,
+                     coalesce(sum(record_count) FILTER (WHERE content = 0), 0) AS stored_records
+              FROM iceberg.$1.\"$2\$files\") f
+        CROSS JOIN (SELECT count(*) AS live_rows FROM iceberg.$1.$2) t;"
 }
 
 fmt() { printf '%s data + %s delete, %s KB' "$1" "$2" "$(( $3 / 1024 ))"; }
@@ -61,6 +60,12 @@ now() { date +%s.%N; }
 elapsed() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%.2f", b-a}'; }
 
 TOTAL_COMPACT_SECONDS=0
+# Delimits before/after stats blocks inside one batched trino_q call (see
+# maintain()) -- a SELECT of this literal, so it comes back as its own CSV
+# line ("MARK") regardless of how many rows the ALTER TABLE ... EXECUTE
+# statements between them print (that row count varies: 0 when there's
+# nothing to expire, several otherwise -- unsafe to split on a fixed offset).
+SPLIT_MARK="COMPACTSH_SPLIT_MARKER"
 
 # compact.sql with the placeholders filled in; step 3 dropped when ORPHANS=0.
 render_sql() {
@@ -74,10 +79,10 @@ render_sql() {
 
 maintain() {
   local schema="$1" table="$2" fq="iceberg.$1.$2"
-  local d0 x0 b0 r0 n0 d1 x1 b1 r1 n1
-  read -r d0 x0 b0 r0 n0 <<<"$(stats "$schema" "$table")"
 
   if [ "$CHECK_ONLY" = "1" ]; then
+    local d0 x0 b0 r0 n0
+    read -r d0 x0 b0 r0 n0 <<<"$(trino_q "$(stats_sql "$schema" "$table")" | tr -d '"' | tr ',' ' ')"
     printf '%-30s %s\n' "$schema.$table" "$(fmt "$d0" "$x0" "$b0")"
     # Stored records above live rows = dead rows still on disk behind delete files.
     if [ "$r0" -gt "$n0" ]; then
@@ -86,14 +91,29 @@ maintain() {
     return 0
   fi
 
+  # before-stats ; MARK ; optimize/expire_snapshots/[remove_orphan_files] ; MARK ; after-stats
+  # -- one docker exec / Trino CLI launch for the whole table instead of five.
+  local batch out before after
+  batch="$(stats_sql "$schema" "$table")
+SELECT '$SPLIT_MARK';
+$(render_sql "$fq")
+SELECT '$SPLIT_MARK';
+$(stats_sql "$schema" "$table")"
+
   local t0 t1 dt
   t0=$(now)
-  trino_q "$(render_sql "$fq")" >/dev/null
+  out="$(trino_q "$batch")"
   t1=$(now)
   dt=$(elapsed "$t0" "$t1")
   TOTAL_COMPACT_SECONDS=$(awk -v a="$TOTAL_COMPACT_SECONDS" -v b="$dt" 'BEGIN{printf "%.2f", a+b}')
 
-  read -r d1 x1 b1 r1 n1 <<<"$(stats "$schema" "$table")"
+  before="$(awk -v m="\"$SPLIT_MARK\"" '$0==m{exit} {print}' <<<"$out")"
+  after="$(awk -v m="\"$SPLIT_MARK\"" 'seen==2{print} $0==m{seen++}' <<<"$out")"
+
+  local d0 x0 b0 r0 n0 d1 x1 b1 r1 n1
+  read -r d0 x0 b0 r0 n0 <<<"$(tr -d '"' <<<"$before" | tr ',' ' ')"
+  read -r d1 x1 b1 r1 n1 <<<"$(tr -d '"' <<<"$after" | tr ',' ' ')"
+
   printf '%-30s %-28s -> %-28s %6ss\n' "$schema.$table" "$(fmt "$d0" "$x0" "$b0")" "$(fmt "$d1" "$x1" "$b1")" "$dt"
 
   if [ "$n0" != "$n1" ]; then

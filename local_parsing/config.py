@@ -150,12 +150,12 @@ DAILY = Job(
     jars=_JARS,
     spark_conf={
         # ---- the point of this job: strip per-run startup overhead ----
-        "spark.master": "local[2]",                         # no cluster negotiation and 2 threads in this machine 
+        "spark.master": "local[1]",                         # single-threaded local run, no cluster overhead
         "spark.sql.catalogImplementation": "in-memory",     # skip Hive metastore / Derby init
         "spark.ui.enabled": "false",                        # no Jetty Spark-UI server
         "spark.ui.showConsoleProgress": "false",
         "spark.sql.shuffle.partitions": "1",                # tiny data: no 200-task shuffle plan
-        "spark.default.parallelism": "2",
+        "spark.default.parallelism": "1",
         "spark.sql.adaptive.enabled": "false",              # AQE round-trips are pure overhead here
         "spark.sql.adaptive.coalescePartitions.enabled": "false",
         "spark.sql.codegen.wholeStage": "false",            # skip Janino codegen compile for a few-thousand-row plan
@@ -172,7 +172,7 @@ _history_conf = {
     "spark.sql.shuffle.partitions": "50",
     "spark.sql.adaptive.enabled": "true",
     "spark.sql.adaptive.coalescePartitions.enabled": "true",
-    # Set the advisory partition size to 128MB
+    # Set the advisory partition size to 128MB to avoid too many small partitions for large tables.
     "spark.sql.adaptive.advisoryPartitionSizeInBytes": "134217728",
     # See DAILY's identical setting: Iceberg's vectorized Arrow reader
     # crashes the JVM reading a merge-on-read table's delete files.

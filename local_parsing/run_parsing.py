@@ -181,7 +181,8 @@ def write_raw(spark, df, target: str, merge_key: str) -> None:
            .tableProperty("format-version", "2")
            .tableProperty("write.merge.mode", "merge-on-read")
            .tableProperty("write.update.mode", "merge-on-read")
-           .tableProperty("write.metadata.previous-versions-max", "10")
+           .tableProperty("write.metadata.previous-versions-max", "5")
+           .tableProperty("write.metadata.delete-after-commit.enabled", "true")
            .createOrReplace())
         return
 
@@ -203,7 +204,8 @@ def write_result(spark, df, target: str, write_mode: str, merge_key: str) -> Non
            .tableProperty("format-version", "2")
            .tableProperty("write.merge.mode", "merge-on-read")
            .tableProperty("write.update.mode", "merge-on-read")
-           .tableProperty("write.metadata.previous-versions-max", "10")
+           .tableProperty("write.metadata.previous-versions-max", "5")
+           .tableProperty("write.metadata.delete-after-commit.enabled", "true")
            .createOrReplace())
         return
 

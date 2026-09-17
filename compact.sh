@@ -20,7 +20,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SQL_FILE="$HERE/compact.sql"
 LOG_FILE="$HERE/compact.log"
-RETENTION="${RETENTION:-0d}"
+RETENTION="${RETENTION:-0s}"
 SCHEMAS="${SCHEMAS:-bronze staging}"
 ORPHANS="${ORPHANS:-1}"
 CHECK_ONLY=0

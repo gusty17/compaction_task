@@ -29,6 +29,10 @@ services:
     depends_on:
       - oracle-xe
       - iceberg-rest
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
     ports:
       - "8080:8080"
     environment:
@@ -38,6 +42,7 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
     volumes:
       - ./trino-catalog:/etc/trino/catalog
+      - ./trino-config/config.properties:/etc/trino/config.properties:ro
 
   minio:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z

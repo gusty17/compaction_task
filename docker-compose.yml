@@ -7,6 +7,7 @@ x-airflow-env: &airflow-env
   AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?Set AIRFLOW_FERNET_KEY in .env}
   TRINO_HOST: trino
   TRINO_PORT: "8080"
+  ORACLE_SCHEMA: ${ORACLE_SCHEMA:-source_table}
 
 services:
   oracle-xe:

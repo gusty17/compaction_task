@@ -48,7 +48,6 @@ reasoning.
 | `python_parsing.py` | The XML-parsing library - a **faithful copy** of the repo-root `python_parsing.py` (only `scb.core.logger` → stdlib `logging`). `apply_xml_parsing`, `normalize_arrays`, `reconcile_iceberg_schema` + helpers. Diff fixes straight against the bank's file. |
 | `config.py` | All settings. `DATASETS` (a `Dataset` per source table) + `JOBS` (`DAILY` / `HISTORY`) + shared Oracle/Iceberg/S3 constants. Only the 4 secrets (Oracle + MinIO user/password) are non-literal - read from the repo-root `.env` via `python-dotenv`. |
 | `fetch_jars.sh` | Downloads the 9 pinned jars into `jars/` (versions mirror `spark-operator/spark-custom-image/Dockerfile`). Safe to re-run - skips any jar already present. |
-| `requirements.txt` | `pyspark==3.5.5`, `python-dotenv` (+ a JDK 11/17). |
 
 ## `daily` vs `history`: every setting that differs, and what it costs
 
@@ -110,7 +109,7 @@ speed optimization.
 
 ```bash
 # a JDK 11 or 17 on JAVA_HOME / PATH, e.g.: sudo apt install openjdk-17-jdk-headless
-pip install -r local_parsing/requirements.txt
+pip install -r requirements.txt
 bash local_parsing/fetch_jars.sh
 # no winutils.exe/hadoop.dll needed on Linux (that's a Windows-only Hadoop requirement)
 ```
@@ -125,16 +124,16 @@ prepend `$JAVA_HOME/bin` to `PATH`). Adding those two lines to the end of
 If `pip install` fails with `externally-managed-environment` (recent Debian/Ubuntu),
 use a venv instead: `python3 -m venv .venv && source .venv/bin/activate` (installing
 `python3-venv` first via your own `sudo apt install python3-venv` if that command
-itself is missing), then re-run `pip install -r local_parsing/requirements.txt`
+itself is missing), then re-run `pip install -r requirements.txt`
 inside it. If a venv genuinely isn't an option, `pip install --user
---break-system-packages -r local_parsing/requirements.txt` is a user-scoped
+--break-system-packages -r requirements.txt` is a user-scoped
 fallback that doesn't touch system-managed packages.
 
 The Docker stack must be up (`docker compose up -d`); on a fresh DB,
 `init-scripts/00_setup.sh` creates the users and tables (schema only). Data
 still needs seeding once, per table, from the host:
 ```bash
-pip install -r init-scripts/requirements.txt
+pip install -r requirements.txt
 python init-scripts/account/seed_account.py
 ```
 

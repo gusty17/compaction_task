@@ -37,6 +37,7 @@ test-results/
 # Python
 __pycache__/
 *.pyc
+.venv/
 
 # local_parsing runner: vendored jars + Spark scratch (not committed)
 local_parsing/jars/
@@ -47,6 +48,9 @@ local_parsing/derby.log
 
 local_parsing/.jdk/
 local_parsing/.venv/
+
+# Airflow runtime output (task/scheduler logs, incl. the scheduler/latest symlink)
+airflow/logs/
 
 # Operating-system files
 Thumbs.db

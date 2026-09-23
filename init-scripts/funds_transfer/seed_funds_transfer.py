@@ -3,7 +3,7 @@
 the empty table).
 
 Usage:
-    pip install -r init-scripts/requirements.txt
+    pip install -r requirements.txt
     python init-scripts/funds_transfer/seed_funds_transfer.py [--count N] [--reset]
 
 Inserts the fixture row (reference/funds_transfer_xml_data_sample.xml), then

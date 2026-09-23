@@ -1,7 +1,18 @@
+
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:-airflow}@airflow-db:5432/${AIRFLOW_DB_NAME:-airflow}
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:?Set AIRFLOW_SECRET_KEY in .env}
+  AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?Set AIRFLOW_FERNET_KEY in .env}
+  TRINO_HOST: trino
+  TRINO_PORT: "8080"
+
 services:
   oracle-xe:
     image: gvenzl/oracle-xe:21-slim
     container_name: oracle-xe
+    restart: unless-stopped
     environment:
       ORACLE_PASSWORD: ${ORACLE_PASSWORD:?Set ORACLE_PASSWORD in .env}
       ORACLE_SCHEMA: ${ORACLE_SCHEMA:-source_table}
@@ -21,14 +32,17 @@ services:
       retries: 15
 
   # Not used by local_parsing (which talks to Oracle and the Iceberg REST
-  # catalog directly). Present because table maintenance -- compact.sh --
-  # runs as Trino SQL. See compact.sh.
+  # catalog directly). Present because table maintenance -- the Airflow
+  # compact_iceberg DAG -- runs as Trino SQL.
   trino:
     image: trinodb/trino:483
     container_name: trino
+    restart: unless-stopped
     depends_on:
-      - oracle-xe
-      - iceberg-rest
+      oracle-xe:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
     deploy:
       resources:
         limits:
@@ -40,6 +54,10 @@ services:
       ORACLE_APP_PASSWORD: ${ORACLE_APP_PASSWORD:?Set ORACLE_APP_PASSWORD in .env}
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
+      # trino-config/config.properties reads this via ${ENV:CATALOG_MANAGEMENT}.
+      # The image happens to default it to `static`, but relying on an image
+      # default for our own config file is a trap -- set it explicitly.
+      CATALOG_MANAGEMENT: static
     volumes:
       - ./trino-catalog:/etc/trino/catalog
       - ./trino-config/config.properties:/etc/trino/config.properties:ro
@@ -47,6 +65,7 @@ services:
   minio:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
     container_name: minio
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
@@ -79,6 +98,7 @@ services:
   iceberg-catalog-db:
     image: postgres:16
     container_name: iceberg-catalog-db
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${ICEBERG_CATALOG_DB_USER:-iceberg}
       POSTGRES_PASSWORD: ${ICEBERG_CATALOG_DB_PASSWORD:-iceberg}
@@ -96,6 +116,7 @@ services:
   iceberg-rest:
     image: tabulario/iceberg-rest:1.6.0
     container_name: iceberg-rest
+    restart: unless-stopped
     depends_on:
       minio-bootstrap:
         condition: service_completed_successfully
@@ -114,8 +135,115 @@ services:
       CATALOG_JDBC_PASSWORD: ${ICEBERG_CATALOG_DB_PASSWORD:-iceberg}
     ports:
       - "8181:8181"
+    # The image ships no healthcheck and has no curl/wget, so this uses bash's
+    # own /dev/tcp -- enough for trino to wait on "port is actually accepting"
+    # instead of just "container created".
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8181"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  # ── Airflow: daily Iceberg compaction, see airflow/dags/compact_iceberg.py ──
+  # LocalExecutor + its own small Postgres (same call as iceberg-catalog-db --
+  # one DAG/two tasks/once-a-day doesn't need the full Celery/Redis/worker
+  # stack). Talks to Trino directly over this network (trino:8080) via the
+  # Python `trino` client -- no Docker socket needed. The client is baked into
+  # a small image `docker compose up` builds itself from the inline Dockerfile
+  # below; versions live in airflow/requirements.txt. Changed that file?
+  # `docker compose up -d --build` (plain `up` reuses the existing image).
+  airflow-db:
+    image: postgres:16
+    container_name: airflow-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER:-airflow}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME:-airflow}
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER:-airflow} -d ${AIRFLOW_DB_NAME:-airflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  airflow-init:
+    build: &airflow-build
+      context: ./airflow          # only so the COPY below can reach requirements.txt
+      dockerfile_inline: |
+        FROM apache/airflow:2.10.5-python3.12
+        COPY requirements.txt /tmp/requirements.txt
+        # pinning apache-airflow stops pip from upgrading/downgrading Airflow itself
+        RUN pip install --no-cache-dir "apache-airflow==2.10.5" -r /tmp/requirements.txt
+    image: &airflow-image compaction-airflow:2.10.5
+    container_name: airflow-init
+    user: "${AIRFLOW_UID:-50000}:0"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?Set AIRFLOW_ADMIN_PASSWORD in .env}
+      AIRFLOW_ADMIN_EMAIL: ${AIRFLOW_ADMIN_EMAIL:-admin@example.com}
+
+    volumes: &airflow-volumes
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+    command: >-
+      bash -c "airflow db migrate &&
+      (airflow users list | grep -qw $$AIRFLOW_ADMIN_USER ||
+      airflow users create --username $$AIRFLOW_ADMIN_USER
+      --password $$AIRFLOW_ADMIN_PASSWORD
+      --firstname admin --lastname admin --role Admin
+      --email $$AIRFLOW_ADMIN_EMAIL)"
+
+  airflow-webserver:
+    build: *airflow-build
+    image: *airflow-image
+    container_name: airflow-webserver
+    restart: unless-stopped
+    user: "${AIRFLOW_UID:-50000}:0"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment: *airflow-env
+    volumes: *airflow-volumes
+    ports:
+      - "8090:8080"          # trino already owns host 8080
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  airflow-scheduler:
+    build: *airflow-build
+    image: *airflow-image
+    container_name: airflow-scheduler
+    restart: unless-stopped
+    user: "${AIRFLOW_UID:-50000}:0"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      trino:                 # the DAG's only real dependency -- don't schedule
+        condition: service_healthy   # compaction at a Trino that isn't up yet
+    environment: *airflow-env
+    volumes: *airflow-volumes
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
 volumes:
   oracle-data:
   minio-data:
   iceberg-catalog-pg:
+  airflow-db-data:

@@ -20,7 +20,7 @@ outside the window (see the local-parsing-requirements skill, Requirement 3).
 ``Dataset`` per table, ``Job`` per mode).  With ``all``, one dataset failing
 is logged and the rest still run; the process exits non-zero if any failed.
 
-One-time setup:  pip install -r local_parsing/requirements.txt   (+ a JDK 11/17)
+One-time setup:  pip install -r requirements.txt   (+ a JDK 11/17)
                  bash local_parsing/fetch_jars.sh
 """
 

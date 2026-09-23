@@ -4,7 +4,7 @@
 # Runs once, automatically, on a fresh DB volume (gvenzl's init mechanism).
 #
 # Data is seeded separately, per table, from the host -- e.g.:
-#   pip install -r init-scripts/requirements.txt
+#   pip install -r requirements.txt
 #   python init-scripts/account/seed_account.py
 #
 # Adding a table: drop init-scripts/<table>/create_<table>.sql (schema-

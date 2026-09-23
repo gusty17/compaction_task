@@ -3,7 +3,7 @@
 the empty table).
 
 Usage:
-    pip install -r init-scripts/requirements.txt
+    pip install -r requirements.txt
     python init-scripts/collateral/seed_collateral.py [--count N] [--reset]
 
 Inserts the fixture row (reference/collateral_xml_data_sample.xml), then

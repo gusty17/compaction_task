@@ -3,7 +3,7 @@
 the empty table).
 
 Usage:
-    pip install -r init-scripts/requirements.txt
+    pip install -r requirements.txt
     python init-scripts/stmt_entry/seed_stmt_entry.py [--count N] [--reset]
 
 Inserts the fixture row (reference/stmt_entry_xml_data_sample.xml), then

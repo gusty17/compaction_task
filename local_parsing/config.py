@@ -85,17 +85,17 @@ class Dataset:
     raw_table: str = ""       # optional permanent raw-XML landing table; "" = staging.{name}_raw_spark
 
 DATASETS: dict[str, "Dataset"] = {
-    "account": Dataset(
-        name="account",
-        source_table="account",
-        target_table="bronze.account_wide",
-        date_field="c167",
-    ),
     "customer": Dataset(
         name="customer",
         source_table="customer",
         target_table="bronze.customer_wide",
         date_field="c167",          # last_review_date -- same tag number as account's date_field
+    ),
+    "account": Dataset(
+        name="account",
+        source_table="account",
+        target_table="bronze.account_wide",
+        date_field="c167",
     ),
     "stmt_entry": Dataset(
         name="stmt_entry",

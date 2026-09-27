@@ -4,7 +4,7 @@ the empty table).
 
 Usage:
     pip install -r requirements.txt
-    python init-scripts/customer/seed_customer.py [--count N] [--start-date YYYYMMDD] [--end-date YYYYMMDD] [--reset]
+    python init-scripts/customer/seed_customer.py --count 100 --start-date 20031209 --end-date 20031209 
 
 Inserts the fixture row (reference/customer_xml_data_sample.xml), then
 generates --count more by varying only `recid` (PK / MERGE key) and `c167`

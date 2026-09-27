@@ -12,20 +12,6 @@ from airflow.exceptions import AirflowSkipException
 
 log = logging.getLogger(__name__)
 
-# Step 1: merge small files into large ones and apply merge-on-read deletes
-# (rewrites files below file_size_threshold, default 100MB). Makes queries fast again.
-# Step 2: expire snapshots older than the retention threshold.
-COMPACT_STEPS = [
-    "ALTER TABLE {table} EXECUTE optimize",
-    "ALTER TABLE {table} EXECUTE expire_snapshots(retention_threshold => '{retention}')",
-]
-# Step 3: remove files not referenced by any snapshot -- the step that actually
-# deletes from the file system. Runs in its own task, only after compact_tables
-# succeeded, and is skipped when the `orphans` param is off.
-ORPHAN_STEPS = [
-    "ALTER TABLE {table} EXECUTE remove_orphan_files(retention_threshold => '{retention}')",
-]
-
 
 def stats_sql(schema: str, table: str) -> str:
     """One row: data_files, delete_files, bytes, stored_records, live_rows.
@@ -61,6 +47,13 @@ def fetch_stats(cur, schema: str, table: str) -> dict:
 
 def fmt(stats: dict) -> str:
     return f"{stats['data_files']} data + {stats['delete_files']} delete, {stats['bytes'] // 1024} KB"
+
+
+def latest_snapshot_id(cur, schema: str, table: str):
+    """The table's current snapshot id, or None for a table with no snapshots yet."""
+    cur.execute(f'SELECT snapshot_id FROM iceberg.{schema}."{table}$snapshots" ORDER BY committed_at DESC LIMIT 1')
+    row = cur.fetchone()
+    return row[0] if row else None
 
 
 @contextmanager
@@ -118,6 +111,45 @@ def run_steps(cur, tables: list[tuple[str, str]], steps: list[str], retention: s
         raise RuntimeError("row-count guard failed:\n" + "\n".join(failures))
 
 
+def compact_with_rollback(cur, tables: list[tuple[str, str]], retention: str, check_only: bool) -> None:
+ 
+    failures = []
+    for schema, table in tables:
+        fq = f"iceberg.{schema}.{table}"
+        t0 = time.perf_counter()
+        before = fetch_stats(cur, schema, table)
+
+        if check_only:
+            dt = time.perf_counter() - t0
+            log.info("%-30s %s -> %s  %.2fs  (check_only)", fq, fmt(before), fmt(before), dt)
+            continue
+
+        cur.execute(f"ALTER TABLE {fq} EXECUTE expire_snapshots(retention_threshold => '{retention}')")
+        cur.fetchall()
+
+        pre_optimize_snapshot = latest_snapshot_id(cur, schema, table)
+
+        cur.execute(f"ALTER TABLE {fq} EXECUTE optimize")
+        cur.fetchall()
+
+        after = fetch_stats(cur, schema, table)
+        dt = time.perf_counter() - t0
+        log.info("%-30s %s -> %s  %.2fs", fq, fmt(before), fmt(after), dt)
+
+        if before["live_rows"] != after["live_rows"]:
+            log.error("%-30s row count changed %d -> %d -- rolling back to snapshot %s",
+                       fq, before["live_rows"], after["live_rows"], pre_optimize_snapshot)
+            cur.execute(f"ALTER TABLE {fq} EXECUTE rollback_to_snapshot(snapshot_id => {pre_optimize_snapshot})")
+            cur.fetchall()
+            failures.append(
+                f"{fq}: row count changed {before['live_rows']} -> {after['live_rows']} "
+                f"-- rolled back to snapshot {pre_optimize_snapshot}"
+            )
+
+    if failures:
+        raise RuntimeError("row-count guard failed (rolled back):\n" + "\n".join(failures))
+
+
 #airflow dags trigger compact_iceberg
 @dag(
     dag_id="compact_iceberg",
@@ -142,11 +174,9 @@ def compact_iceberg():
     @task(task_id="compact_tables")
     def compact_tables(**context) -> None:
         params = context["params"]
-        # check_only = report-only: no steps, just the before/after stats
-        steps = [] if params["check_only"] else COMPACT_STEPS
         with trino_cursor() as cur:
             tables = discover_tables(cur, params["schemas"].split())
-            run_steps(cur, tables, steps, params["retention"])
+            compact_with_rollback(cur, tables, params["retention"], params["check_only"])
 
     @task(task_id="remove_orphans")
     def remove_orphans(**context) -> None:
@@ -155,7 +185,7 @@ def compact_iceberg():
             raise AirflowSkipException("orphan sweep off (orphans=0 or check_only=true)")
         with trino_cursor() as cur:
             tables = discover_tables(cur, params["schemas"].split())
-            run_steps(cur, tables, ORPHAN_STEPS, params["retention"])
+            run_steps(cur, tables, ["ALTER TABLE {table} EXECUTE remove_orphan_files(retention_threshold => '{retention}')"], params["retention"])
 
     # orphans are only swept after compaction (and its row-count guard) passed
     compact_tables() >> remove_orphans()

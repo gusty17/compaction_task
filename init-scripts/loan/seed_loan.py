@@ -4,12 +4,12 @@ the empty table).
 
 Usage:
     pip install -r requirements.txt
-    python init-scripts/loan/seed_loan.py [--count N] [--reset]
+    python init-scripts/loan/seed_loan.py [--count N] [--start-date YYYYMMDD] [--end-date YYYYMMDD] [--reset]
 
 Inserts the fixture row (reference/loan_xml_data_sample.xml), then
 generates --count more by varying only `recid` (PK / MERGE key) and `c167`
 (disbursement_date -- the same tag number account's own date_field uses),
-spread across the trailing 365 days so both `daily` and `history` runs
+spread across --start-date/--end-date (default: the trailing 365 days ending today) so both `daily` and `history` runs
 have data. Everything else is left as-is - this is for exercising the
 parsing pipeline and its timings, not field realism.
 
@@ -32,12 +32,7 @@ DEFAULT_ROW_COUNT = 10000
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--count", type=int, default=DEFAULT_ROW_COUNT,
-                         help=f"rows to generate on top of what's already there (default {DEFAULT_ROW_COUNT})")
-    parser.add_argument("--first-recid", type=int, default=DEFAULT_FIRST_RECID,
-                         help=f"start of the generated range on an empty/--reset table (default {DEFAULT_FIRST_RECID})")
-    parser.add_argument("--reset", action="store_true",
-                         help="delete existing rows before seeding, restarting the generated range at --first-recid")
+    lib.add_seed_args(parser, default_count=DEFAULT_ROW_COUNT, default_first_recid=DEFAULT_FIRST_RECID)
     args = parser.parse_args()
 
     lib.run_seed(table=TABLE, fixture_xml=FIXTURE_XML, date_tag=DATE_TAG, args=args)

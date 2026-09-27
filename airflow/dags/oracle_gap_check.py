@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from contextlib import contextmanager
 from datetime import timedelta
 from typing import NamedTuple
@@ -10,6 +11,8 @@ import pendulum
 from airflow.decorators import dag, task
 
 log = logging.getLogger(__name__)
+
+_DATE_RE = re.compile(r"^\d{8}$")
 
 
 class Dataset(NamedTuple):
@@ -31,26 +34,41 @@ DATASETS = [
 ]
 
 
-def oracle_counts_sql(schema: str, table: str, date_tag: str) -> str:
+def _resolve_window(start_date: str, end_date: str) -> tuple[str, str] | None:
+    """Both empty -> None (full history). Both given -> validated (start, end).
+    One given without the other, or either not YYYYMMDD, raises."""
+    if bool(start_date) != bool(end_date):
+        raise ValueError("start_date and end_date must be given together")
+    if not start_date:
+        return None
+    for d in (start_date, end_date):
+        if not _DATE_RE.match(d):
+            raise ValueError(f"window date {d!r} is not YYYYMMDD")
+    return (start_date, end_date)
+
+
+def oracle_counts_sql(schema: str, table: str, date_tag: str, window: tuple[str, str] | None = None) -> str:
 
     date_expr = (
         f"XMLCAST(XMLQUERY('/row/{date_tag}/text()' PASSING a.xmlrecord "
         f"RETURNING CONTENT) AS VARCHAR2(8))"
     )
+    where = f" WHERE {date_expr} BETWEEN '{window[0]}' AND '{window[1]}'" if window else ""
     # Bare COUNT(*) is an unbounded Oracle NUMBER, which the connector refuses
     # to map ("DECIMAL precision must be in range [1, 38]: 0").
     inner = (
         f"SELECT {date_expr} AS business_date, CAST(COUNT(*) AS NUMBER(19,0)) AS row_count "
-        f"FROM {schema}.{table} a GROUP BY {date_expr}"
+        f"FROM {schema}.{table} a{where} GROUP BY {date_expr}"
     )
     return f"SELECT * FROM TABLE(oracle.system.query(query => '{inner.replace(chr(39), 2 * chr(39))}'))"
 
 
-def iceberg_counts_sql(table: str, date_col: str) -> str:
+def iceberg_counts_sql(table: str, date_col: str, window: tuple[str, str] | None = None) -> str:
 
+    where = f" WHERE {date_col} BETWEEN '{window[0]}' AND '{window[1]}'" if window else ""
     return (
         f"SELECT {date_col} AS business_date, COUNT(*) AS row_count "
-        f"FROM iceberg.{table} GROUP BY {date_col}"
+        f"FROM iceberg.{table}{where} GROUP BY {date_col}"
     )
 
 
@@ -100,13 +118,14 @@ def diff_counts(oracle: dict[str | None, int], iceberg: dict[str | None, int]) -
         "retry_delay": timedelta(minutes=5),
         "execution_timeout": timedelta(hours=1),
     },
-    params={"datasets": "all"},
+    params={"datasets": "all", "start_date": "", "end_date": ""},
     tags=["oracle", "iceberg", "data-quality"],
 )
 def oracle_gap_check():
     @task(task_id="check_gaps")
     def check_gaps(**context) -> None:
-        selector = context["params"]["datasets"]
+        params = context["params"]
+        selector = params["datasets"]
         datasets = (
             DATASETS if selector == "all"
             else [d for d in DATASETS if d.name in selector.split()]
@@ -115,20 +134,23 @@ def oracle_gap_check():
             known = " ".join(d.name for d in DATASETS)
             raise ValueError(f"no dataset matches {selector!r} -- known datasets: {known}")
 
+        window = _resolve_window(params["start_date"], params["end_date"])
+
         schema = os.environ["ORACLE_SCHEMA"]
         failures = []
 
         with trino_cursor() as cur:
             for ds in datasets:
-                oracle = fetch_counts(cur, oracle_counts_sql(schema, ds.oracle_table, ds.date_tag))
-                iceberg = fetch_counts(cur, iceberg_counts_sql(ds.bronze_table, ds.bronze_date_column))
+                oracle = fetch_counts(cur, oracle_counts_sql(schema, ds.oracle_table, ds.date_tag, window))
+                iceberg = fetch_counts(cur, iceberg_counts_sql(ds.bronze_table, ds.bronze_date_column, window))
                 gaps = diff_counts(oracle, iceberg)
 
                 log.info(
-                    "%-16s oracle %d rows / %d dates -> bronze %d rows / %d dates  %s",
+                    "%-16s oracle %d rows / %d dates -> bronze %d rows / %d dates  %s  window=%s",
                     ds.name, sum(oracle.values()), len(oracle),
                     sum(iceberg.values()), len(iceberg),
                     "OK" if not gaps else f"{len(gaps)} date(s) MISSING ROWS",
+                    window or "FULL",
                 )
                 for line in gaps:
                     log.warning("  %s %s", ds.name, line)

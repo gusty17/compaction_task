@@ -5,18 +5,53 @@ File: [`airflow/dags/compact_iceberg.py`](../airflow/dags/compact_iceberg.py)
 ## Purpose
 
 Daily maintenance for every Iceberg table under the schemas this DAG is pointed
-at (default: `bronze` and `staging`). Iceberg tables never overwrite data in
-place — every write adds new files and a new snapshot — so over time a table
-accumulates:
+at (default: `bronze` and `staging`). Iceberg tables never overwrite anything
+in place — every write adds new files and a new snapshot — so over time a
+table accumulates:
 
-- many small data files (one write's worth at a time, rather than a few large
-  ones) → slow queries,
-- a long chain of old snapshots (kept for time-travel/rollback) → growing
-  metadata,
-- files from superseded snapshots that nothing references anymore
-  ("orphans") → wasted storage.
+- many small data files (one write's worth at a time) → slow queries,
+- many small manifest files (one per write) → slow query planning,
+- a long chain of old snapshots, and the files only they use → growing
+  storage,
+- true "orphans": files a crashed or aborted write left behind that no
+  snapshot ever referenced → wasted storage.
 
-This DAG addresses all three, per table, across two dependent tasks.
+This DAG addresses all four, per table, across two dependent tasks.
+
+## Iceberg in one picture
+
+```
+metadata.json            one per commit — the table's current state
+  └─ snapshot            one per commit — one version of the table
+       └─ manifest list  exactly one per snapshot (snap-*.avro)
+            └─ manifest files   lists of data files (*-m*.avro)
+                 └─ data files + delete files   (*.parquet)
+```
+
+Every step below that changes something (`optimize`, `optimize_manifests`,
+`rollback_to_snapshot`) writes a **new** snapshot — it never edits existing
+files. That's what makes rollback possible: the previous snapshot and all the
+files it uses are still there.
+
+**The one rule for deletion:** a file can only be deleted once **no snapshot
+that is still kept** uses it.
+
+## What each step does
+
+| Step | What it does | Deletes | Adds |
+|---|---|---|---|
+| `expire_snapshots` | Drops every snapshot older than `retention` (never the current one) | Manifest lists, manifest files, data files and delete files that no remaining snapshot uses | 1 `metadata.json` |
+| `optimize` | Rewrites small data files, and files with delete files, into fewer larger ones | Nothing | Data file(s), manifests, manifest list, snapshot, `metadata.json` |
+| `optimize_manifests` | Rewrites all manifest files into a few larger ones | Nothing | Manifest(s), manifest list, snapshot, `metadata.json` |
+| `remove_orphan_files` | Lists the table's storage folder; deletes files no snapshot references, older than `retention` | Only never-committed leftovers of crashed/aborted writes | Nothing |
+
+The files `optimize` and `optimize_manifests` replace are therefore deleted
+by the **next** run's `expire_snapshots` — not by `remove_orphan_files`, and
+not in the same run. That one-day delay is what keeps the rollback target
+usable.
+
+Old `metadata.json` files are not deleted by any of the four steps — see
+[Table properties](#table-properties-and-trino-catalog-settings).
 
 ## How it works
 
@@ -24,82 +59,166 @@ This DAG addresses all three, per table, across two dependent tasks.
 
 1. Reads its run params (`retention`, `schemas`, `check_only`).
 2. `discover_tables()` runs `SHOW TABLES FROM iceberg.<schema>` for every
-   schema in `params.schemas` (space-separated), building the full list of
-   tables to process.
+   schema in `params.schemas` (space-separated).
 3. For each table, `compact_with_rollback()`:
-   - Captures **before** stats: data/delete file count, total bytes, live row
-     count (via Iceberg's `"$files"` metadata table plus a plain row count).
-   - Runs the maintenance SQL in this specific order (skipped entirely when
-     `check_only=True` — a dry run that only reports stats):
+   - Captures **before** stats: data/delete file count and total bytes (from
+     Iceberg's `$files` metadata table) plus a plain live row count.
+   - With `check_only=True`, logs those stats and moves to the next table —
+     no statement is executed.
+   - Otherwise runs, in this order:
      ```sql
      ALTER TABLE {table} EXECUTE expire_snapshots(retention_threshold => '{retention}')
-     -- capture the resulting current snapshot id here, before optimize runs --
+     -- capture the current snapshot id here: the rollback target --
      ALTER TABLE {table} EXECUTE optimize
+     ALTER TABLE {table} EXECUTE optimize_manifests
      ```
    - Captures **after** stats and logs before → after.
-   - **Correctness guard**: if the live row count changed as a result of
-     `optimize`, that's a bug signal — maintenance should only ever change
-     *how* data is stored, never *what* data exists. On a guard failure,
-     **this table alone is automatically rolled back**
-     (`rollback_to_snapshot(snapshot_id => {the id captured right before
-     optimize})`) and added to a failure list — every other table is
-     unaffected and still gets attempted (see Limitation 2's current status).
-4. If any table failed its guard, the task raises after every table in the
-   loop has been attempted.
+   - **Row-count guard:** maintenance must only change *how* data is stored,
+     never *what* data exists. If the live row count changed, that table is
+     rolled back (`rollback_to_snapshot` to the captured id) and added to a
+     failure list; the remaining tables are still processed.
+   - **Crash guard:** if `optimize`, `optimize_manifests` or the after-stats
+     query raises (Trino error, `execution_timeout`, …), anything already
+     committed was never checked by the row-count guard, so the table is
+     rolled back to the captured id and the task fails immediately.
+     - If nothing was committed yet (the crash was inside `optimize`
+       itself), the table is unchanged and no rollback is issued.
+     - The rollback is best effort: if Trino itself is down it fails too,
+       and the original error is what gets raised.
+   - The captured id is the table's **current** snapshot: the newest
+     `is_current_ancestor` row of `$history`. Not simply the newest snapshot
+     — after a rollback, the snapshot rolled away from is still the newest
+     row in `$snapshots` and `$history`.
+4. If any table failed the row-count guard, the task raises after every
+   table has been attempted.
 
 ### Task 2: `remove_orphans`
 
-- Only runs after `compact_tables` succeeds
-  (`compact_tables() >> remove_orphans()`).
-- Skips entirely (`AirflowSkipException`) when `params.orphans=0` or
+- Only runs after `compact_tables` succeeded
+  (`compact_tables() >> remove_orphans()`), so it never runs after a failed
+  or rolled-back compaction.
+- Skips (`AirflowSkipException`) when `params.orphans=0` or
   `params.check_only=True`.
-- Re-discovers the same tables and runs the one genuinely destructive step:
+- Re-discovers the tables and runs, per table:
   ```sql
   ALTER TABLE {table} EXECUTE remove_orphan_files(retention_threshold => '{retention}')
   ```
-  This is the only statement anywhere in the DAG that physically deletes
-  files from the object store. `optimize` and `expire_snapshots` only
-  rewrite/prune *metadata* pointers (see below).
+- Also checks the row count before and after and raises if it changed (no
+  rollback here: `remove_orphan_files` creates no snapshot to roll back from).
 
-### Why `expire_snapshots` then `optimize` (not the reverse), and what each actually deletes
+### Why this order
 
-- `expire_snapshots` prunes old, now-superseded snapshots from the table's
-  history, and — as part of that same commit — **immediately** deletes the
-  manifest and manifest-list files that were exclusively used by those
-  pruned snapshots. It never touches the *current* (live) snapshot, no
-  matter how short the retention is set. Run first, it only ever prunes
-  history left over from *previous* runs.
-- `optimize` rewrites small data files into fewer, larger ones and commits a
-  **new** snapshot. The files it replaces are untouched — they simply stop
-  being part of the *current* live file set; the snapshot they belonged to
-  is still fully valid, just no longer current.
-- Running `expire_snapshots` **before** `optimize` is what makes rollback
-  possible: since `expire_snapshots` already ran for today, the snapshot
-  `optimize` is about to supersede stays alive until *tomorrow's* run
-  instead of being expired in the same breath it's created — giving
-  `rollback_to_snapshot` something real to target if the guard trips.
-- The old data files `optimize` replaces become **orphans**: physically
-  present, no longer referenced by anything. They're only found and
-  physically deleted by `remove_orphan_files`, which is exactly why it's a
-  separate, later task — it's the only step that touches actual data, so it
-  only ever runs once compaction has been verified safe by the row-count
-  guard.
+- **`expire_snapshots` first.** It only prunes history left over from
+  *previous* runs. If it ran after `optimize`, it would expire the
+  pre-optimize snapshot straight away, and a failed guard would have nothing
+  to roll back to.
+- **`optimize` before `optimize_manifests`.** So the merged manifests already
+  point at the compacted data files; the other way round, `optimize` would
+  immediately add new small manifests again.
+- **`remove_orphan_files` last, as a separate task.** It's the only step that
+  decides what to delete by listing storage instead of reading the table's
+  metadata, so it only runs once compaction has passed its guards.
 
-**Verified live** (see the conversation this doc was generated from): a
-disposable test table was compacted, its old manifests/manifest-lists were
-confirmed physically deleted immediately by `expire_snapshots` while its old
-*data* files survived until a separate `remove_orphan_files` call removed
-them — and separately, `rollback_to_snapshot` was confirmed to fully restore
-both row count and row contents after a simulated bad compaction.
+### When `expire_snapshots` deletes data files
+
+A data file replaced by `optimize` is only deleted once the snapshot that
+**replaced** it is itself expired — not while that snapshot is still current.
+So on a fresh table:
+
+| Run | `expire_snapshots` deletes |
+|---|---|
+| Day 1 | old manifest lists only — every data file is still used by the current snapshot |
+| Day 2 | the data + delete files and manifests day 1's `optimize` / `optimize_manifests` replaced |
+
+This is why `expire_snapshots` can look like it "never deletes data files"
+when tested once in isolation.
+
+### What `optimize` picks, and how big the output is
+
+- Every data file smaller than `file_size_threshold` — Trino's default
+  100MB, which the DAG uses.
+- Every data file that has delete files attached, **whatever its size** —
+  its deletes are applied and the delete files dropped. (Bronze tables are
+  merge-on-read, so updates/deletes create delete files.)
+- A single small file with nothing to merge it with is left alone.
+- Output files are capped at `iceberg.target-max-file-size` (512MB here,
+  Trino's default is 1GB). It's a target, not a hard cap: files can end up
+  slightly larger.
+
+### How big merged manifests are
+
+`optimize_manifests` fills one manifest until it reaches the table property
+`commit.manifest.target-size-bytes`, then starts the next. The DAG doesn't
+set it, so Iceberg's default of **8MB** applies — tens of thousands of file
+entries per manifest, so for these tables one run normally ends with a
+single manifest. Each run rewrites all manifests from scratch.
+
+The manifest *list* can't be compacted — there is exactly one per snapshot —
+and old ones are deleted with their snapshot by `expire_snapshots`.
 
 ## Parameters
 
 | Param | Default | Meaning |
 |---|---|---|
 | `retention` | `"0s"` | Passed to both `expire_snapshots` and `remove_orphan_files`. **Local-stack-only value — see Limitation 1.** |
-| `orphans` | `1` | Whether `remove_orphans` actually runs (`0` = always skip). |
+| `orphans` | `1` | Whether `remove_orphans` runs (`0` = always skip). |
 | `schemas` | `"bronze staging"` | Space-separated list of schemas to discover tables from. |
-| `check_only` | `False` | Dry run — reports before/after stats with **no** statements executed; `remove_orphans` always skips. |
+| `check_only` | `False` | Dry run — reports stats with **no** statements executed; `remove_orphans` always skips. |
+
+## Table properties and Trino catalog settings
+
+Settings in [`trino-catalog/iceberg.properties`](../trino-catalog/iceberg.properties)
+(Trino must be restarted to pick up changes: `docker compose restart trino`):
+
+| Setting | Value here | Trino default | Effect |
+|---|---|---|---|
+| `iceberg.expire-snapshots.min-retention` | `0s` | 7d | Trino refuses to run `expire_snapshots` with a lower `retention_threshold`. **Local only — Limitation 1.** |
+| `iceberg.remove-orphan-files.min-retention` | `0s` | 7d | Same, for `remove_orphan_files`. **Local only — Limitation 1.** |
+| `iceberg.target-max-file-size` | `512MB` | 1GB | Target size of files Trino writes, including `optimize` output. |
+| `iceberg.delete-after-commit-enabled` | `true` | — | Default for new tables: delete old `metadata.json` files on each commit… |
+| `iceberg.max-previous-versions` | `5` | — | …keeping the current one plus this many previous. |
+
+**Old `metadata.json` files.** Every commit writes a new one; none of the
+four steps deletes old ones. They're trimmed on every commit by two table
+properties:
+
+| Iceberg table property | Trino table property | Catalog default above |
+|---|---|---|
+| `write.metadata.delete-after-commit.enabled` | `delete_after_commit_enabled` | `iceberg.delete-after-commit-enabled` |
+| `write.metadata.previous-versions-max` | `max_previous_versions` | `iceberg.max-previous-versions` |
+
+- The catalog defaults only apply to tables **Trino creates** (as in
+  production). A single table can override them:
+  `CREATE TABLE … WITH (max_previous_versions = N)`.
+- Tables created elsewhere keep their own values. Locally that's every
+  bronze table: `local_parsing` (Spark) creates them with
+  `previous-versions-max = 5` (older tables may still have 10). Change one
+  with `ALTER TABLE … SET PROPERTIES max_previous_versions = N`; the extra
+  files are trimmed on the next commit.
+- Check a table's values:
+  ```sql
+  SELECT key, value FROM iceberg.bronze."account_wide$properties"
+  WHERE key LIKE 'write.metadata%';
+  ```
+
+## Verified
+
+On an isolated copy of this stack (same Trino, Iceberg REST and MinIO images
+and config; a format-v2 merge-on-read table like bronze), each step was run
+alone and the files in object storage were listed before and after:
+
+- Each step's deletes/adds match the [table above](#what-each-step-does).
+- Two DAG runs in a row: day 1's `expire_snapshots` deleted no data files;
+  day 2's deleted the 5 data + 2 delete files day 1's `optimize` replaced.
+  `remove_orphan_files` deleted only a planted never-committed file.
+- `optimize` output follows `iceberg.target-max-file-size`; a file above
+  `file_size_threshold` is still rewritten once it has a delete file.
+- `optimize_manifests` follows `commit.manifest.target-size-bytes`.
+- A crash after `optimize` committed was rolled back to the exact
+  pre-optimize snapshot; a crash inside `optimize` left the table unchanged
+  and issued no rollback.
+- `iceberg.max-previous-versions` applied to Trino-created tables only;
+  `ALTER TABLE … SET PROPERTIES max_previous_versions` fixed an existing one.
 
 ## Limitations, and the fix for each, before production
 
@@ -107,84 +226,69 @@ both row count and row contents after a simulated bad compaction.
 
 `trino-catalog/iceberg.properties` deliberately lowers Trino's own safety
 floor (`iceberg.expire-snapshots.min-retention=0s`,
-`iceberg.remove-orphan-files.min-retention=0s`) specifically so this DAG
-would do anything visible against snapshots that are only minutes old. In
-production, a retention this short risks deleting files a slow, still-running
-read is depending on, or files a concurrent writer has staged but not yet
-committed.
+`iceberg.remove-orphan-files.min-retention=0s`) so this DAG does something
+visible against snapshots that are only minutes old. In production, a
+retention this short risks deleting files a slow, still-running read depends
+on, or files a concurrent writer has written but not yet committed (which
+look exactly like orphans to `remove_orphan_files`).
 
-**Fix:** raise `retention` (and the connector's `min-retention` settings) to
-a value comfortably longer than the slowest realistic read or write in
-production. Trino's own un-overridden default (7 days) is a reasonable
-starting point, not an arbitrary one.
+**Fix:** raise `retention` (and both `min-retention` settings) to a value
+comfortably longer than the slowest realistic read or write. Trino's
+default of 7 days is a reasonable starting point.
 
-### 2. ~~A bad table doesn't stop the run, and nothing rolls it back automatically~~ — rollback: FIXED, loop behavior: still open
+### 2. A rollback also discards other writers' commits
 
-**Fixed:** `compact_with_rollback()` now captures each table's snapshot id
-before `optimize`, and on a guard failure automatically issues
-`rollback_to_snapshot(snapshot_id => {captured_id})` against that one table,
-restoring it fully before recording the failure. Confirmed live: a simulated
-bad compaction was fully reverted, both row count and row contents.
+`rollback_to_snapshot` returns the table to the captured snapshot — so
+anything *another* writer committed after it (e.g. an ingestion run landing
+mid-compaction) is discarded too.
 
-**Still true, and an open decision, not a bug:** the loop still continues
-through every remaining table after one fails (now safely rolled back)
-rather than stopping immediately — so a systemic bug can still touch every
-table in one run before the DAG fails, it just no longer leaves any of them
-in a wrong state. Stopping the loop on the first failure instead (to bound
-how many tables a systemic problem gets to touch at all) is a separate,
-still-open change if that tighter blast-radius control is wanted.
+**Fix:** schedule this DAG away from ingestion (see Limitation 5).
 
-### 3. ~~Today's step order gives zero rollback window~~ — FIXED
+### 3. The loop continues after a failed table — an open decision, not a bug
 
-**Fixed:** the DAG now runs `expire_snapshots` first, `optimize` second (see
-"Why `expire_snapshots` then `optimize`" above). Iceberg never expires the
-*current* snapshot regardless of retention, so this order prunes only
-already-superseded history from prior runs; the snapshot `optimize` is about
-to supersede survives until the *next* scheduled run — which is exactly what
-makes the rollback in Limitation 2 possible at all, not just a longer manual
-window.
+After a table fails the row-count guard (and is rolled back), the loop still
+processes every remaining table before the task fails. A systemic bug can
+therefore touch every table in one run — none is left in a wrong state, but
+all get rolled back. Stopping on the first failure would bound that; it's a
+small change if that tighter control is wanted. (A *crash* already stops
+the loop immediately.)
 
 ### 4. First production run on a real backlog will not resemble local testing
 
-Local runs finish in roughly 3–5s per table against a handful of files. A
-production table compacted for the first time against a genuine backlog
-(10,000+ accumulated small files) is a fundamentally different workload —
-dominated by per-file object-store round-trips and total data volume, not a
-linear scale-up from the local number. A realistic range is minutes to a few
-hours for that first pass.
+Local runs take a few seconds per table against a handful of files. A
+production table compacted for the first time against a real backlog
+(10,000+ small files) is a different workload — dominated by object-store
+round-trips and total data volume. Expect minutes to a few hours for that
+first pass.
 
-**Fix:** `default_args.execution_timeout` is currently `timedelta(hours=1)`
-— either raise it specifically for the first catch-up run, or run that first
-pass manually/out-of-band before turning on the regular `@daily` schedule,
-so the routine timeout isn't tested against an atypically large one-time
-backlog.
+**Fix:** `default_args.execution_timeout` is `timedelta(hours=1)` — raise it
+for the first catch-up run, or run that first pass manually before turning
+on the `@daily` schedule. (A timeout mid-compaction is rolled back by the
+crash guard, so the risk is wasted work, not a broken table.)
 
 ### 5. No coordination with concurrent writers (dbt, or Spark ingestion via `local_parsing`)
 
-Iceberg's own optimistic-concurrency commit protocol guarantees no silent
-corruption if this DAG runs at the same moment as a write to the same table
-— but a genuine overlap (specifically: `optimize` rewriting a data file while
-a concurrent `MERGE` adds delete-markers against that same file) can make
-either side's commit fail outright once Iceberg's own automatic retries are
-exhausted, requiring a manual re-run (`dbt retry`, or re-running
-`run_parsing.py`). Nothing here detects or waits for that.
+Iceberg's optimistic-concurrency commits guarantee no silent corruption if
+this DAG runs at the same moment as a write to the same table — but a real
+overlap (e.g. `optimize` rewriting a data file while a concurrent `MERGE`
+adds delete files against it) can make either side's commit fail once
+Iceberg's automatic retries are exhausted, requiring a re-run. Combined with
+Limitation 2, a rollback can also discard the other writer's commit.
 
-Also relevant: Spark's writes (`local_parsing`) go directly to the Iceberg
-REST catalog and object store — they never go through Trino — so Trino's
-own `system.runtime.queries` can't be used to see them coming, even as a
-heuristic.
+Spark's writes go directly to the Iceberg REST catalog and object store,
+never through Trino, so Trino's `system.runtime.queries` can't see them
+coming.
 
 **Fix options, roughly in order of effort:**
 - Simplest: schedule this DAG at a time known not to overlap with
   ingestion/dbt runs.
 - More robust: an explicit lock — e.g. a small table in `iceberg-catalog-db`
-  (already in this stack) that writers acquire before committing and release
-  in a `finally` block, checked by an Airflow sensor here before
-  `compact_tables` touches a given table. Not implemented today; requires
-  matching changes on both the writer side and this DAG.
+  that writers acquire before committing and release in a `finally` block,
+  checked by an Airflow sensor before `compact_tables` touches a table.
+  Needs matching changes on the writer side.
 
 ### 6. `check_only` isn't a complete no-op
 
 It skips every mutating statement and always skips `remove_orphans`, but
-`compact_tables` still runs `discover_tables()`/`fetch_stats()` against
-Trino/Oracle even in dry-run mode. Cheap, but not literally zero activity.
+`compact_tables` still runs `discover_tables()` and `fetch_stats()` (a full
+row count per table) against Trino. Cheap on these tables, but not zero.

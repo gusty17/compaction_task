@@ -49,11 +49,26 @@ def fmt(stats: dict) -> str:
     return f"{stats['data_files']} data + {stats['delete_files']} delete, {stats['bytes'] // 1024} KB"
 
 
-def latest_snapshot_id(cur, schema: str, table: str):
-    """The table's current snapshot id, or None for a table with no snapshots yet."""
-    cur.execute(f'SELECT snapshot_id FROM iceberg.{schema}."{table}$snapshots" ORDER BY committed_at DESC LIMIT 1')
+def current_snapshot_id(cur, schema: str, table: str):
+    """The table's current snapshot id, or None for a table with no snapshots yet.
+    Newest *current ancestor* in $history: after a rollback the snapshot that
+    was rolled away from is still the newest row in both $snapshots and
+    $history, just no longer an ancestor of the current state."""
+    cur.execute(
+        f'SELECT snapshot_id FROM iceberg.{schema}."{table}$history" '
+        f"WHERE is_current_ancestor ORDER BY made_current_at DESC LIMIT 1"
+    )
     row = cur.fetchone()
     return row[0] if row else None
+
+
+def rollback_if_changed(cur, fq: str, schema: str, table: str, snapshot_id) -> bool:
+    """Roll `fq` back to `snapshot_id` unless it is still current. True if it rolled back."""
+    if snapshot_id is None or current_snapshot_id(cur, schema, table) == snapshot_id:
+        return False
+    cur.execute(f"ALTER TABLE {fq} EXECUTE rollback_to_snapshot(snapshot_id => {snapshot_id})")
+    cur.fetchall()
+    return True
 
 
 @contextmanager
@@ -127,20 +142,37 @@ def compact_with_rollback(cur, tables: list[tuple[str, str]], retention: str, ch
         cur.execute(f"ALTER TABLE {fq} EXECUTE expire_snapshots(retention_threshold => '{retention}')")
         cur.fetchall()
 
-        pre_optimize_snapshot = latest_snapshot_id(cur, schema, table)
+        pre_optimize_snapshot = current_snapshot_id(cur, schema, table)
 
-        cur.execute(f"ALTER TABLE {fq} EXECUTE optimize")
-        cur.fetchall()
+        try:
+            cur.execute(f"ALTER TABLE {fq} EXECUTE optimize")
+            cur.fetchall()
 
-        after = fetch_stats(cur, schema, table)
+            # default manifest file size after optmize is 8MB
+            cur.execute(f"ALTER TABLE {fq} EXECUTE optimize_manifests")
+            cur.fetchall()
+
+            after = fetch_stats(cur, schema, table)
+        except Exception:
+            # Whatever optimize / optimize_manifests committed was never
+            # verified by the row-count guard, so undo it before failing.
+            # Best effort: if Trino itself is down the rollback fails too, and
+            # the original error is what gets raised.
+            log.exception("%-30s failed mid-compaction -- rolling back to snapshot %s", fq, pre_optimize_snapshot)
+            try:
+                if rollback_if_changed(cur, fq, schema, table, pre_optimize_snapshot):
+                    log.error("%-30s rolled back to snapshot %s", fq, pre_optimize_snapshot)
+            except Exception:
+                log.exception("%-30s rollback failed too -- table left at its current snapshot", fq)
+            raise
+
         dt = time.perf_counter() - t0
         log.info("%-30s %s -> %s  %.2fs", fq, fmt(before), fmt(after), dt)
 
         if before["live_rows"] != after["live_rows"]:
             log.error("%-30s row count changed %d -> %d -- rolling back to snapshot %s",
                        fq, before["live_rows"], after["live_rows"], pre_optimize_snapshot)
-            cur.execute(f"ALTER TABLE {fq} EXECUTE rollback_to_snapshot(snapshot_id => {pre_optimize_snapshot})")
-            cur.fetchall()
+            rollback_if_changed(cur, fq, schema, table, pre_optimize_snapshot)
             failures.append(
                 f"{fq}: row count changed {before['live_rows']} -> {after['live_rows']} "
                 f"-- rolled back to snapshot {pre_optimize_snapshot}"

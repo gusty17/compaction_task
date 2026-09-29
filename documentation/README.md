@@ -6,7 +6,9 @@ and — the part that matters most before running these in production — every
 known limitation with the concrete fix for it.
 
 - [`compact_iceberg.md`](compact_iceberg.md) — daily Iceberg table
-  maintenance (compaction, snapshot expiry, orphan-file removal).
+  maintenance (snapshot expiry, data-file and manifest compaction,
+  orphan-file removal), with automatic rollback on a failed or crashed
+  compaction.
 - [`oracle_gap_check.md`](oracle_gap_check.md) — daily data-quality check
   comparing Oracle source row counts against parsed Iceberg `bronze` row
-  counts, per business date.
+  counts, per business date; emails an alert when bronze is missing rows.

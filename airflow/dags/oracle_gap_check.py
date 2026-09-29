@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import smtplib
 from contextlib import contextmanager
 from datetime import timedelta
+from email.message import EmailMessage
 from typing import NamedTuple
 
 import pendulum
@@ -13,6 +15,7 @@ from airflow.decorators import dag, task
 log = logging.getLogger(__name__)
 
 _DATE_RE = re.compile(r"^\d{8}$")
+_ALERT_MAX_LINES = 50
 
 
 class Dataset(NamedTuple):
@@ -106,6 +109,23 @@ def diff_counts(oracle: dict[str | None, int], iceberg: dict[str | None, int]) -
     return gaps
 
 
+def send_alert_email(recipients: list[str], subject: str, body: str) -> None:
+    # STARTTLS on 587 (Gmail, Outlook, most relays); stdlib only so no
+    # provider package is needed. The sender is always the account that logs
+    # in -- deliberately not configurable, so alerts can't be spoofed.
+    sender = os.environ["SMTP_USER"]
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    with smtplib.SMTP(os.environ["SMTP_HOST"], int(os.environ.get("SMTP_PORT", "587")), timeout=30) as smtp:
+        smtp.starttls()
+        smtp.login(sender, os.environ["SMTP_PASSWORD"])
+        smtp.send_message(msg)
+
+
 # airflow dags trigger oracle_gap_check
 @dag(
     dag_id="oracle_gap_check",
@@ -123,7 +143,7 @@ def diff_counts(oracle: dict[str | None, int], iceberg: dict[str | None, int]) -
 )
 def oracle_gap_check():
     @task(task_id="check_gaps")
-    def check_gaps(**context) -> None:
+    def check_gaps(**context) -> list[str]:
         params = context["params"]
         selector = params["datasets"]
         datasets = (
@@ -156,13 +176,36 @@ def oracle_gap_check():
                     log.warning("  %s %s", ds.name, line)
                     failures.append(f"{ds.name} {line}")
 
-        if failures:
-            raise RuntimeError(
-                f"{len(failures)} date(s) with rows in Oracle missing from bronze:\n"
-                + "\n".join(failures)
-            )
+        return failures
 
-    check_gaps()
+    # Separate task so a failed email send retries without re-running the
+    # Oracle scan, and so gaps alert instead of failing the check itself.
+    @task(task_id="alert_gaps")
+    def alert_gaps(failures: list[str], **context) -> None:
+        if not failures:
+            log.info("no gaps found")
+            return
+
+        shown = failures[:_ALERT_MAX_LINES]
+        more = len(failures) - len(shown)
+        subject = f"[oracle_gap_check] {len(failures)} date(s) missing from bronze"
+        body = (
+            f"Run: {context['run_id']}\n"
+            f"{len(failures)} date(s) with rows in Oracle missing from bronze:\n\n"
+            + "\n".join(shown)
+            + (f"\n... and {more} more (see task log)" if more else "")
+        )
+
+        recipients = os.environ.get("GAP_ALERT_EMAIL_TO", "").split()
+        if not recipients:
+            # No alert channel means nobody would ever see a green run's gaps,
+            # and Oracle purges them -- fall back to failing loudly.
+            raise RuntimeError(f"GAP_ALERT_EMAIL_TO not set, failing instead of alerting:\n{body}")
+
+        send_alert_email(recipients, subject, body)
+        log.warning("alert emailed to %s for %d gap(s)", ", ".join(recipients), len(failures))
+
+    alert_gaps(check_gaps())
 
 
 oracle_gap_check()

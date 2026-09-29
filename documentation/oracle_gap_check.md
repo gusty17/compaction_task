@@ -32,8 +32,16 @@ that will ever exist. A missed date caught late may be unrecoverable.
    where **Oracle's count is strictly greater than bronze's** — i.e., rows
    exist in the source that are missing from bronze. (See Limitation 2 — the
    reverse case is not flagged.)
-4. Any gaps found are logged per dataset/date and raised as a single
-   `RuntimeError` listing every gap, failing the task.
+4. Any gaps found are logged per dataset/date and passed to a second task,
+   `alert_gaps`, which emails them (first 50 lines, full list in the log) to
+   `GAP_ALERT_EMAIL_TO` over SMTP (`SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/
+   `SMTP_PASSWORD`, STARTTLS). The run stays **green**
+   when gaps are found, so red means the check itself broke (Trino/Oracle
+   down, bad params), not a data finding. A failed send retries just
+   `alert_gaps`; the Oracle scan isn't re-run.
+   - If `GAP_ALERT_EMAIL_TO` is unset, `alert_gaps` fails with the gap list
+     instead. Oracle purges old rows, so a gap nobody sees can become
+     permanent loss, which makes a silent green run unacceptable.
 
 ## Parameters
 

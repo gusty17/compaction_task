@@ -31,12 +31,13 @@ script. With `all`, one dataset failing is logged and the rest still run
 T24 has a short retention window and deletes source rows after it passes -
 whatever this reads from Oracle may be the only copy of that XML that will
 ever exist. So before `apply_xml_parsing` touches anything, `run_one()`
-writes the untouched raw XML to its own Iceberg table (`Dataset.raw_table`,
-default `staging.<name>_raw_spark` - a separate table from dbt's
-`iceberg.staging.account_raw`, so the two pipelines never write the same
-table). This happens on **every** run, `daily` and `history` alike, and uses
-a conditional merge on `recid` (only updates a row when its `xmlrecord`
-actually changed), matching `dbt`'s `conditional_merge` macro. See the
+writes the untouched raw XML as plain Parquet files (`write_raw_parquet`)
+to a per-run folder, `<RAW_PARQUET_ROOT>/<name>_raw/load_id=<UTC timestamp>/`
+(`Dataset.raw_path` overrides the `<name>_raw` root). Each run gets its own
+folder and nothing is ever overwritten, so the raw landing stays permanent.
+Parsing then reads that run's Parquet back (`read_raw_parquet`). This happens
+on **every** run, `daily` and `history` alike. Unlike the old Iceberg raw
+table there is no merge/dedup on `recid` - every run's rows are kept. See the
 `local-parsing-requirements` skill (Requirements 2 and 3) for the full
 reasoning.
 
@@ -44,8 +45,10 @@ reasoning.
 
 | File | What |
 |---|---|
-| `run_parsing.py` | The local plumbing: `build_spark_session()`, the Oracle read, `write_raw()` (permanent raw-XML landing), `write_result()` (the parsed Iceberg write), `run_one()` (one dataset), `main()` (`argparse` CLI + per-dataset loop). Imports the parsing logic from `python_parsing.py`. |
+| `run_parsing.py` | The local plumbing: `build_spark_session()`, the Oracle read, `write_raw_parquet()` / `read_raw_parquet()` (permanent raw-XML Parquet landing), `write_result()` (the parsed Iceberg write), `run_one()` (one dataset), `main()` (`argparse` CLI + per-dataset loop). Imports the parsing logic from `python_parsing.py`. |
 | `python_parsing.py` | The XML-parsing library - a **faithful copy** of the repo-root `python_parsing.py` (only `scb.core.logger` → stdlib `logging`). `apply_xml_parsing`, `normalize_arrays`, `reconcile_iceberg_schema` + helpers. Diff fixes straight against the bank's file. |
+| `python_parsing_optimized.py` | Same as `python_parsing.py`, except `apply_xml_parsing(..., columns=)` parses only the selected columns (`_select_rows`). |
+| `bench_parsing.py` | Times raw-Parquet read → parse N columns → Iceberg write for several N (`python local_parsing/bench_parsing.py account`); appends to `parsing_results.csv`. |
 | `config.py` | All settings. `DATASETS` (a `Dataset` per source table) + `JOBS` (`DAILY` / `HISTORY`) + shared Oracle/Iceberg/S3 constants. Only the 4 secrets (Oracle + MinIO user/password) are non-literal - read from the repo-root `.env` via `python-dotenv`. |
 | `fetch_jars.sh` | Downloads the 9 pinned jars into `jars/` (versions mirror `spark-operator/spark-custom-image/Dockerfile`). Safe to re-run - skips any jar already present. |
 
@@ -69,8 +72,8 @@ Python↔JVM transfer. Driver heap for local runs comes from
 `spark_conf` dict.
 
 **Also shared, and *not* optimized away**: the `write_raw` phase (raw XML →
-its own Iceberg table, before parsing) runs on every `daily` and `history`
-invocation alike, adding one more Iceberg write to each. This is accepted,
+Parquet, before parsing) runs on every `daily` and `history` invocation
+alike, adding one more write to each. This is accepted,
 correctness-driven overhead, not a gap in the tuning above - T24's retention
 window means an unpersisted read may be the only copy of that data that will
 ever exist. See the `local-parsing-requirements` skill, Requirement 2.
@@ -153,8 +156,9 @@ python init-scripts/account/seed_account.py
   `table_name = customer`.
 - `Dataset.target_table` - `"bronze.account_wide"` **is** dbt's real table. Use
   `"bronze.account_wide_spark"` until this path is the deliberate cutover.
-- `Dataset.raw_table` - defaults to `"staging.<name>_raw_spark"`; override only
-  if a table needs a different raw-landing name.
+- `Dataset.raw_path` - raw-XML Parquet root; defaults to
+  `"<RAW_PARQUET_ROOT>/<name>_raw"` (`RAW_PARQUET_ROOT` env, default
+  `s3a://raw`).
 - `DAILY.window` / `HISTORY.window` - each job's *default* window when no
   `--start-date`/`--end-date` is given on the CLI (`("today","today")` /
   `None` respectively). Prefer the CLI flags for a one-off reprocess; edit

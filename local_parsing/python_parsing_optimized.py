@@ -1,9 +1,8 @@
-"""XML-parsing library - verbatim port of the bank's repo-root ``python_parsing.py``.
+"""Optimized XML-parsing library - based on ``python_parsing.py``.
 
-The only change from the original is the logger: stdlib ``logging`` here vs
-``scb.core.logger`` there.  ``run_parsing.py`` imports ``apply_xml_parsing``,
-``normalize_arrays`` and ``reconcile_iceberg_schema`` from this module; keeping
-it a faithful copy means fixes can be diffed straight against the bank's file.
+The only difference: ``apply_xml_parsing`` takes ``columns`` and parses only
+those columns (``_select_rows``).  The full raw XML is still landed by
+``run_parsing.write_raw_parquet``.  Benchmarked by ``bench_parsing.py``.
 """
 
 from __future__ import annotations
@@ -262,9 +261,36 @@ def normalize_arrays(df):
 
 
 
-def apply_xml_parsing(spark, df, schema, metadata_cols):
+def _select_rows(rows: list, columns=None) -> list:
+    """
+    Keep only the mapping rows for the columns that need parsing.
+
+      None       -> every row (original behaviour)
+      int N      -> the first N rows, in lookup order
+      list[str]  -> exactly the rows whose resolved_name_en is listed
+
+    Filtering here, before _build_xml_schema, is what makes the parse cheaper:
+    the from_xml schema then only holds the needed tags.
+    """
+    if columns is None:
+        return rows
+    if isinstance(columns, int):
+        if columns <= 0:
+            raise ValueError(f"columns must be positive, got {columns}")
+        return rows[:columns]
+    wanted = set(columns)
+    selected = [r for r in rows if r["resolved_name_en"] in wanted]
+    missing = wanted - {r["resolved_name_en"] for r in selected}
+    if missing:
+        raise ValueError(f"Columns not in lookup metadata: {sorted(missing)}")
+    return selected
+
+
+def apply_xml_parsing(spark, df, schema, metadata_cols, columns=None):
     logger.info("Building XML schema configuration")
-    rows = schema.collect()
+    all_rows = schema.collect()
+    rows = _select_rows(all_rows, columns)
+    logger.info(f"Parsing {len(rows)} of {len(all_rows)} columns")
     xml_col_name = "XMLRECORD"
     xml_schema = _build_xml_schema(rows)
 

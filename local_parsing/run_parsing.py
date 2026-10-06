@@ -32,6 +32,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
@@ -164,35 +165,27 @@ def _table_exists(spark, fqn: str) -> bool:
         return False
 
 
-def write_raw(spark, df, target: str, merge_key: str) -> None:
-    #Land the untouched raw XML permanently, before any parsing.
+def write_raw_parquet(df, path: str, mode: str = "errorifexists") -> None:
+    """Land the untouched raw XML (every tag) as plain Parquet, before any parsing.
+
+    ``path`` is a per-run ``load_id=`` folder (config.raw_parquet_path), so the
+    default ``errorifexists`` never overwrites an earlier run's raw data.
+    """
     from pyspark.sql import functions as F
 
     raw_df = df.select(
         F.col("recid"),
-        F.col("XMLRECORD").alias("xmlrecord"),
+        F.col("XMLRECORD"),
         F.current_timestamp().alias("ingested_at"),
     )
-    if not _table_exists(spark, target):
-        ns = ".".join(target.split(".")[:-1])
-        spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {ns}")
-        logger.info("bootstrap create raw table %s", target)
-        (raw_df.writeTo(target).using("iceberg")
-           .tableProperty("format-version", "2")
-           .tableProperty("write.merge.mode", "merge-on-read")
-           .tableProperty("write.update.mode", "merge-on-read")
-           .tableProperty("write.metadata.previous-versions-max", "5")
-           .tableProperty("write.metadata.delete-after-commit.enabled", "true")
-           .createOrReplace())
-        return
+    logger.info("writing raw XML parquet -> %s", path)
+    raw_df.write.mode(mode).parquet(path)
 
-    raw_df.createOrReplaceTempView("_raw_updates")
-    spark.sql(
-        f"MERGE INTO {target} t USING _raw_updates s "
-        f"ON t.{merge_key} = s.{merge_key} "
-        f"WHEN MATCHED AND t.xmlrecord IS DISTINCT FROM s.xmlrecord THEN UPDATE SET * "
-        f"WHEN NOT MATCHED THEN INSERT *"
-    )
+
+def read_raw_parquet(spark, path: str):
+    """Read one run's raw-XML Parquet folder back for parsing."""
+    logger.info("reading raw XML parquet <- %s", path)
+    return spark.read.parquet(path)
 
 
 def write_result(spark, df, target: str, write_mode: str, merge_key: str) -> None:
@@ -237,7 +230,8 @@ def run_one(spark, dataset, job, window_override=None, table_seconds: dict | Non
 
     window = window_override if window_override is not None else config.resolve_window(job)
     target = config.target_fqn(dataset)
-    raw_target = config.raw_fqn(dataset)
+    load_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    raw_path = config.raw_parquet_path(dataset, load_id)
     write_mode = job.write_mode
     if window_override is not None and write_mode == "replace":
         write_mode = "merge"
@@ -252,13 +246,13 @@ def run_one(spark, dataset, job, window_override=None, table_seconds: dict | Non
         timings[name] = time.perf_counter() - t
         return out
 
-    logger.info("dataset=%s  job=%s  target=%s  raw_target=%s  window=%s  reader=%s  write-mode=%s",
-                dataset.name, job.name, target, raw_target, window or "FULL", job.reader, write_mode)
+    logger.info("dataset=%s  job=%s  target=%s  raw_path=%s  window=%s  reader=%s  write-mode=%s",
+                dataset.name, job.name, target, raw_path, window or "FULL", job.reader, write_mode)
 
     schema_df = phase("load_lookup", lambda: load_lookup(spark, dataset))
     raw_df = phase("read", lambda: read_jdbc(spark, dataset, job, window))
-    # cache: read is lazy for the jdbc reader, so without this, count/write_raw/parse
-    # below would each re-issue the Oracle query instead of reusing the one read.
+    # cache: read is lazy for the jdbc reader, so without this, count and
+    # write_raw below would each re-issue the Oracle query.
     raw_df = raw_df.cache()
     n = phase("count_source", raw_df.count)
     logger.info("source rows: %d", n)
@@ -269,16 +263,18 @@ def run_one(spark, dataset, job, window_override=None, table_seconds: dict | Non
             table_seconds[dataset.name] = sum(timings.values())
         return
 
-    phase("write_raw", lambda: write_raw(spark, raw_df, raw_target, dataset.merge_key))
+    phase("write_raw", lambda: write_raw_parquet(raw_df, raw_path))
+    raw_df.unpersist()
 
+    # parse from the landed Parquet, not from the Oracle read
+    staged_df = read_raw_parquet(spark, raw_path)
     parsed = phase("parse", lambda: apply_xml_parsing(
-        spark, raw_df, schema_df, metadata_cols=[F.col("recid")]))
+        spark, staged_df, schema_df, metadata_cols=[F.col("recid")]))
     if dataset.normalize_arrays:
         parsed = phase("normalize_arrays", lambda: normalize_arrays(parsed))
 
     phase("write", lambda: write_result(spark, parsed, target, write_mode, dataset.merge_key))
     final_n = phase("count_target", spark.table(target).count)
-    raw_df.unpersist()
 
     logger.info("---- timings (s) [%s] ----", dataset.name)
     for name, secs in timings.items():

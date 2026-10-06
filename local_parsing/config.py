@@ -55,6 +55,9 @@ S3_ENDPOINT = _secret("MINIO_ENDPOINT", "http://localhost:9000")
 S3_REGION = _secret("AWS_REGION", "us-east-1")
 S3_ACCESS_KEY = _secret("MINIO_ROOT_USER")
 S3_SECRET_KEY = _secret("MINIO_ROOT_PASSWORD")
+# Raw XML landing: plain Parquet in its own MinIO bucket (outside the Iceberg
+# warehouse), via Hadoop S3A, one folder per run.
+RAW_PARQUET_ROOT = _secret("RAW_PARQUET_ROOT", "s3a://raw")
 
 # Jars must exist in JARS_DIR - run:  pwsh local_parsing/fetch_jars.ps1
 # Both jobs read via Spark JDBC now (daily: 1 partition, history: N)
@@ -82,7 +85,7 @@ class Dataset:
     date_field: str = "c167"        # XML tag under /row driving the daily window filter
     oracle_schema: str = ORACLE_SCHEMA   # table owner; "" if the connecting user owns it
     normalize_arrays: bool = True   # collapse single-element ARRAY<STRING> -> scalar
-    raw_table: str = ""       # optional permanent raw-XML landing table; "" = staging.{name}_raw_spark
+    raw_path: str = ""        # raw-XML Parquet folder; "" = {RAW_PARQUET_ROOT}/{name}_raw
 
 DATASETS: dict[str, "Dataset"] = {
     "customer": Dataset(
@@ -224,6 +227,21 @@ def iceberg_conf() -> dict:
     }
 
 
+def s3a_conf() -> dict:
+    """Hadoop S3A wiring for the plain-Parquet raw staging on MinIO."""
+    conf = {
+        "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
+        "spark.hadoop.fs.s3a.endpoint": S3_ENDPOINT,
+        "spark.hadoop.fs.s3a.endpoint.region": S3_REGION,
+        "spark.hadoop.fs.s3a.path.style.access": "true",
+        "spark.hadoop.fs.s3a.connection.ssl.enabled": str(S3_ENDPOINT.startswith("https")).lower(),
+    }
+    if S3_ACCESS_KEY:
+        conf["spark.hadoop.fs.s3a.access.key"] = S3_ACCESS_KEY
+        conf["spark.hadoop.fs.s3a.secret.key"] = S3_SECRET_KEY
+    return conf
+
+
 def spark_conf_for(job: Job) -> dict:
     """Job's tuned conf + shared Iceberg wiring + resolved ``spark.jars``."""
     missing = [j for j in job.jars if not os.path.isfile(os.path.join(JARS_DIR, j))]
@@ -234,6 +252,7 @@ def spark_conf_for(job: Job) -> dict:
         )
     conf = dict(job.spark_conf)
     conf.update(iceberg_conf())
+    conf.update(s3a_conf())
     conf["spark.jars"] = ",".join(
         os.path.join(JARS_DIR, j).replace("\\", "/") for j in job.jars
     )
@@ -261,9 +280,11 @@ def target_fqn(ds: Dataset) -> str:
     return _qualify(ds.target_table, NAMESPACE)
 
 
-def raw_fqn(ds: Dataset) -> str:
-    """Permanent raw-XML landing table -- see Dataset.raw_table."""
-    return _qualify(ds.raw_table or f"staging.{ds.name}_raw_spark", NAMESPACE)
+def raw_parquet_path(ds: Dataset, load_id: str) -> str:
+    """This run's raw-XML Parquet folder.  One ``load_id=`` folder per run, never
+    overwritten, so the raw landing stays permanent (nothing is deleted)."""
+    root = (ds.raw_path or f"{RAW_PARQUET_ROOT}/{ds.name}_raw").rstrip("/")
+    return f"{root}/load_id={load_id}"
 
 
 def source_fqn(ds: Dataset) -> str:
